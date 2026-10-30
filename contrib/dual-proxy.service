@@ -1,0 +1,17 @@
+[Unit]
+Description=agent-dual-proxy (upstream proxy first, direct on failure)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env node %h/agent-dual-proxy/bin/dual-proxy.js
+Restart=always
+RestartSec=2
+Environment=LISTEN_HOST=127.0.0.1
+Environment=LISTEN_PORT=7898
+Environment=UPSTREAM_HOST=127.0.0.1
+Environment=UPSTREAM_PORT=7897
+Environment=ATTEMPT_TIMEOUT_MS=5000
+
+[Install]
+WantedBy=default.target

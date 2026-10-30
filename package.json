@@ -1,0 +1,43 @@
+{
+  "name": "agent-dual-proxy",
+  "version": "0.5.0",
+  "description": "Local dual-path proxy for CLI agents: auto-selects a gateway that reaches the model endpoint, verifies the channel, fails over to direct",
+  "license": "MIT",
+  "type": "module",
+  "main": "src/server.js",
+  "exports": {
+    ".": "./src/server.js",
+    "./agents": "./src/agents.js",
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "agent-gateway": "bin/agent-gateway.js",
+    "dual-proxy": "bin/dual-proxy.js"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "start": "node bin/dual-proxy.js"
+  },
+  "dependencies": {
+    "undici": "8.12.3"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "bin",
+    "src",
+    "README.md",
+    "LICENSE",
+    "docs"
+  ],
+  "keywords": [
+    "proxy",
+    "failover",
+    "cli-agent",
+    "claude-code",
+    "codex",
+    "gemini",
+    "health-check"
+  ]
+}
