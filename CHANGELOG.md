@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.1
+
+### Changed
+
+- `package.json` 补齐 `repository`、`homepage`、`bugs`、`author`，npm 页面会显示仓库与问题入口。无行为变更。
+
 ## 0.7.0
 
 独立项目的首个正式版本：从 0.5.0 拆出版本回补 0.5.1–0.7.0 的核心演进，并把 agent 适配面扩展到主流 CLI。

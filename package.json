@@ -1,6 +1,6 @@
 {
   "name": "agent-dual-proxy",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "Local dual-path proxy for CLI agents: auto-selects a gateway that reaches the model endpoint, verifies the channel, fails over to direct",
   "license": "MIT",
   "type": "module",
@@ -10,6 +10,15 @@
     "./agents": "./src/agents.js",
     "./package.json": "./package.json"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gambn/agent-dual-proxy.git"
+  },
+  "homepage": "https://github.com/gambn/agent-dual-proxy#readme",
+  "bugs": {
+    "url": "https://github.com/gambn/agent-dual-proxy/issues"
+  },
+  "author": "Gambn",
   "bin": {
     "agent-gateway": "bin/agent-gateway.js",
     "dual-proxy": "bin/dual-proxy.js"
