@@ -1,9 +1,48 @@
 import http from 'node:http';
-import { connectDirect, connectViaProxy, probeTls, probeHttp } from './paths.js';
+import { connectDirect, connectViaProxy, probeTls, probeHttp, LEFTOVER } from './paths.js';
 import { createPref } from './pref.js';
 import { buildCandidates } from './gateways.js';
+import { hasIdempotencyKey, isIdempotent, shouldRetryAfterSend } from './retry-policy.js';
 
 const DEFAULT_LOG = (msg) => process.stderr.write('[dual-proxy] ' + msg + '\n');
+
+/** 合并配置：显式传入的 undefined 不应覆盖默认值。 */
+export function mergeOptions(defaults, options) {
+  const merged = Object.assign({}, defaults);
+  for (const [key, value] of Object.entries(options || {})) {
+    if (value !== undefined) merged[key] = value;
+  }
+  return merged;
+}
+
+const HOP_BY_HOP = new Set([
+  'connection', 'proxy-connection', 'keep-alive', 'proxy-authenticate',
+  'proxy-authorization', 'te', 'trailers', 'transfer-encoding', 'upgrade'
+]);
+
+/** 统一 host 形态：去掉 IPv6 方括号、转小写、去掉 FQDN 末尾的点。 */
+function normalizeHost(host) {
+  return String(host || '').replace(/^\[|\]$/g, '').toLowerCase().replace(/\.$/, '');
+}
+
+/** 按 RFC 9110 去掉逐跳标头（含 Connection 里点名的字段）。 */
+function stripHopByHop(headers) {
+  const dropped = new Set(HOP_BY_HOP);
+  for (const token of String(headers.connection || '').toLowerCase().split(',')) {
+    const name = token.trim();
+    if (name) dropped.add(name);
+  }
+  const clean = {};
+  for (const [name, value] of Object.entries(headers)) {
+    if (!dropped.has(name.toLowerCase())) clean[name] = value;
+  }
+  return clean;
+}
+
+/** 请求方向：清洗后再把 Host 设成目标主机。 */
+function sanitizeHeaders(headers, targetHost) {
+  return Object.assign(stripHopByHop(headers), { host: targetHost });
+}
 
 /** 解析健康检查地址；只接受 http/https。 */
 function parseHealthUrl(value) {
@@ -48,7 +87,7 @@ function parseHealthUrl(value) {
  * @param {function} [options.log]
  */
 export function createDispatcher(options) {
-  const opts = Object.assign({
+  const opts = mergeOptions({
     listenHost: '127.0.0.1',
     listenPort: 7898,
     upstreamHost: '127.0.0.1',
@@ -58,17 +97,31 @@ export function createDispatcher(options) {
     healthIntervalMs: 60000,
     fastFailTimeoutMs: 2000,
     cooldownMs: 30000,
+    retryNonIdempotentAfterSend: false,
+    retryNonIdempotentWithIdempotencyKey: false,
     attemptTimeoutMs: 5000,
+    responseTimeoutMs: 60000,
     prefTtlMs: 60000,
+    prefMaxSize: 1000,
+    shutdownTimeoutMs: 1500,
     verifyTls: true,
     log: DEFAULT_LOG
-  }, options || {});
+  }, options);
 
   const log = opts.log;
-  const pref = createPref(opts.prefTtlMs);
+  const pref = createPref(opts.prefTtlMs, undefined, opts.prefMaxSize);
   const candidates = buildCandidates(
-    { host: opts.upstreamHost, port: opts.upstreamPort }, opts.gateways
+    Object.assign(
+      { host: opts.upstreamHost, port: opts.upstreamPort },
+      opts.upstreamAuth ? { auth: opts.upstreamAuth } : {}
+    ),
+    opts.gateways,
+    { host: opts.listenHost, port: opts.listenPort },
+    (subject, reason) => log('gateway warning: ' + subject + ': ' + reason)
   );
+  const publicCandidates = candidates.map((gateway) => (gateway.direct
+    ? { id: gateway.id, direct: true }
+    : { id: gateway.id, host: gateway.host, port: gateway.port }));
   const health = parseHealthUrl(opts.healthUrl);
   const healthTimeoutMs = opts.healthTimeoutMs || opts.attemptTimeoutMs;
 
@@ -163,6 +216,13 @@ export function createDispatcher(options) {
 
   const MAX_BODY = 8 * 1024 * 1024;   // 超过就不缓冲，也不重试
 
+  /** 所有在途 socket（入站与隧道出站），关闭时用于强制收尾。 */
+  const sockets = new Set();
+  const track = (socket) => {
+    sockets.add(socket);
+    socket.on('close', () => sockets.delete(socket));
+  };
+
   const server = http.createServer((req, res) => {
     let target;
     try {
@@ -178,9 +238,10 @@ export function createDispatcher(options) {
       return;
     }
 
-    const host = target.hostname;
+    const host = normalizeHost(target.hostname);
     const port = Number(target.port || 80);
-    const headers = Object.assign({}, req.headers, { host: target.host });
+    const headers = sanitizeHeaders(req.headers, target.host);
+    const idempotencyKey = hasIdempotencyKey(req.headers);
 
     // 先缓冲请求体：失败换路时要能重放（模型调用多是 JSON POST）
     const chunks = [];
@@ -199,52 +260,151 @@ export function createDispatcher(options) {
       }
       const body = chunks.length ? Buffer.concat(chunks) : undefined;
 
-      const attemptVia = (gateway) => new Promise((resolve) => {
+      // 两段超时：建连用 attempt/fast-fail，等响应头用 responseTimeoutMs；
+      // 响应体开始流之后不再计时（长回答可能很慢）。
+      // sent 以“到网关/目标的 TCP 连接是否建立”为界，用于决定失败后能否重放。
+      const attemptVia = (gateway, connectTimeoutMs) => new Promise((resolve) => {
+        const attemptHeaders = gateway.direct || !gateway.auth
+          ? headers
+          : Object.assign({}, headers, { 'proxy-authorization': gateway.auth });
         const reqOpts = gateway.direct
-          ? { host, port, method: req.method, path: target.pathname + target.search, headers }
-          : { host: gateway.host, port: gateway.port, method: req.method, path: req.url, headers };
-        const upstreamReq = http.request(reqOpts, (up) => resolve({ up }));
-        upstreamReq.on('error', (err) => resolve({ err }));
+          ? { host, port, method: req.method, path: target.pathname + target.search, headers: attemptHeaders }
+          : { host: gateway.host, port: gateway.port, method: req.method, path: req.url, headers: attemptHeaders };
+
+        let sent = false;
+        let connectTimer;
+        let headerTimer;
+        const clearTimers = () => {
+          clearTimeout(connectTimer);
+          clearTimeout(headerTimer);
+        };
+        const fail = (message) => {
+          const err = new Error(message);
+          err.code = 'ETIMEDOUT';
+          clearTimers();
+          resolve({ err, sent });
+          upstreamReq.destroy(err);
+        };
+
+        const upstreamReq = http.request(reqOpts, (up) => {
+          clearTimers();
+          if (!gateway.direct && up.statusCode === 407) {
+            up.resume();
+            up.destroy();
+            resolve({ err: Object.assign(new Error('proxy authentication required'), { code: 'EPROXYAUTH' }), sent: true });
+            return;
+          }
+          resolve({ up });
+        });
+        connectTimer = setTimeout(() => fail('gateway connect timeout'), connectTimeoutMs);
+        upstreamReq.on('socket', (socket) => {
+          const markSent = () => {
+            sent = true;
+            clearTimeout(connectTimer);
+            headerTimer = setTimeout(() => fail('gateway response timeout'), opts.responseTimeoutMs);
+          };
+          if (socket.connecting) socket.once('connect', markSent);
+          else markSent();
+        });
+        upstreamReq.on('error', (err) => {
+          clearTimers();
+          resolve({ err, sent });
+        });
         upstreamReq.end(body);
       });
 
+      const known = pref.get(host) || preferred;
+      const list = order(host);
       (async () => {
-        for (const gateway of order(host)) {
-          const r = await attemptVia(gateway);
-          if (r.err) {
-            log(host + ' ' + gateway.id + ' failed: ' + (r.err.code || r.err.message));
-            noteFailure(gateway);
-            continue;
+        try {
+          for (let i = 0; i < list.length; i += 1) {
+            const gateway = list[i];
+            const timeout = i === 0 && known && opts.fastFailTimeoutMs < opts.attemptTimeoutMs
+              ? opts.fastFailTimeoutMs
+              : opts.attemptTimeoutMs;
+            const r = await attemptVia(gateway, timeout);
+            if (r.err) {
+              log(host + ' ' + gateway.id + ' failed: ' + (r.err.code || r.err.message));
+              noteFailure(gateway);
+              // 407 是代理在转发前拒绝，目标没收到请求：无论方法是否幂等都应换下一条。
+              if (r.err.code === 'EPROXYAUTH') continue;
+              if (!shouldRetryAfterSend({
+                method: req.method,
+                sent: r.sent,
+                retryNonIdempotentAfterSend: opts.retryNonIdempotentAfterSend,
+                retryNonIdempotentWithIdempotencyKey: opts.retryNonIdempotentWithIdempotencyKey,
+                idempotencyKey
+              })) {
+                log(host + ' ' + gateway.id + ' failed after send: ' +
+                  (r.err.code || r.err.message) + '; not replayed (' + req.method + ')');
+                res.writeHead(502);
+                res.end('non-idempotent request may have been delivered; not replayed');
+                return;
+              }
+              if (idempotencyKey && !isIdempotent(req.method) &&
+                opts.retryNonIdempotentWithIdempotencyKey && !opts.retryNonIdempotentAfterSend) {
+                log(host + ' ' + gateway.id + ' failed after send: ' +
+                  (r.err.code || r.err.message) + '; retrying (' + req.method + ', idempotency key)');
+              }
+              continue;
+            }
+            noteSuccess(host, gateway);
+            const up = r.up;
+            up.on('error', () => { try { res.destroy(); } catch (e) { /* ignore */ } });
+            res.on('close', () => {
+              if (!res.writableEnded) { try { up.destroy(); } catch (e) { /* ignore */ } }
+            });
+            res.writeHead(up.statusCode, stripHopByHop(up.headers));
+            up.pipe(res);
+            return;
           }
-          noteSuccess(host, gateway);
-          res.writeHead(r.up.statusCode, r.up.headers);
-          r.up.pipe(res);
-          return;
+          res.writeHead(502);
+          res.end('all gateways failed');
+        } catch (err) {
+          log(host + ' handler error: ' + (err && err.message));
+          if (!res.headersSent) {
+            res.writeHead(502);
+            res.end('proxy error');
+          } else {
+            try { res.destroy(); } catch (e) { /* ignore */ }
+          }
         }
-        res.writeHead(502);
-        res.end('all gateways failed');
       })();
     });
   });
 
+  // 持久兜底：listen 之后 server 级 error 不能再变成未捕获异常；初始 EADDRINUSE 由 listen() 的
+  // 一次性监听负责 reject，这里只记录。
+  server.on('error', (err) => log('server error: ' + (err && err.message ? err.message : String(err))));
+
+  server.on('connection', track);
+
   server.on('connect', async (req, clientSocket, head) => {
     const url = String(req.url);
     const idx = url.lastIndexOf(':');
-    const host = idx === -1 ? url : url.slice(0, idx);
+    const host = normalizeHost(idx === -1 ? url : url.slice(0, idx));
     const port = Number(idx === -1 ? 443 : url.slice(idx + 1)) || 443;
 
     clientSocket.on('error', () => {});
-    const sock = await openTunnel(host, port);
-    if (!sock) {
-      clientSocket.end('HTTP/1.1 502 Bad Gateway\r\n\r\n');
-      return;
+    try {
+      const sock = await openTunnel(host, port);
+      if (!sock) {
+        clientSocket.end('HTTP/1.1 502 Bad Gateway\r\n\r\n');
+        return;
+      }
+      clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+      track(sock);
+      const leftover = sock[LEFTOVER];
+      if (leftover && leftover.length) clientSocket.write(leftover);
+      if (head && head.length) sock.write(head);
+      sock.pipe(clientSocket);
+      clientSocket.pipe(sock);
+      sock.on('error', () => clientSocket.destroy());
+      clientSocket.on('error', () => sock.destroy());
+    } catch (err) {
+      log('connect handler error: ' + (err && err.message));
+      try { clientSocket.end('HTTP/1.1 502 Bad Gateway\r\n\r\n'); } catch (e) { /* ignore */ }
     }
-    clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
-    if (head && head.length) sock.write(head);
-    sock.pipe(clientSocket);
-    clientSocket.pipe(sock);
-    sock.on('error', () => clientSocket.destroy());
-    clientSocket.on('error', () => sock.destroy());
   });
 
   server.on('clientError', (err, socket) => {
@@ -267,25 +427,35 @@ export function createDispatcher(options) {
     return null;
   }
 
-  /** 验证一次通道；通过就设为全局首选并解除它的冷却，失败就清掉首选让请求重新扫描。 */
+  /**
+   * 验证一次通道；通过就设为全局首选并解除它的冷却，失败就清掉首选让请求重新扫描。
+   * 周期检查与失败踢动可能撞在一起，用重入锁保证同一时刻只有一次探测。
+   */
+  let healthRunning = false;
   async function runHealth() {
-    let result = null;
+    if (healthRunning) return;
+    healthRunning = true;
     try {
-      result = await checkHealth();
-    } catch (e) {
-      result = null;
-    }
-    if (result) {
-      if (preferred !== result.id) {
-        log('health: model channel -> ' + result.id + ' (' + result.status + ', ' + result.ms + 'ms)');
+      let result = null;
+      try {
+        result = await checkHealth();
+      } catch (e) {
+        result = null;
       }
-      preferred = result.id;
-      pref.set(health.host, result.id);
-      warm(result.id);
-    } else {
-      if (preferred !== null) log('health: no gateway reached ' + health.host + ':' + health.port);
-      preferred = null;
-      pref.delete(health.host);
+      if (result) {
+        if (preferred !== result.id) {
+          log('health: model channel -> ' + result.id + ' (' + result.status + ', ' + result.ms + 'ms)');
+        }
+        preferred = result.id;
+        pref.set(health.host, result.id);
+        warm(result.id);
+      } else {
+        if (preferred !== null) log('health: no gateway reached ' + health.host + ':' + health.port);
+        preferred = null;
+        pref.delete(health.host);
+      }
+    } finally {
+      healthRunning = false;
     }
   }
 
@@ -316,17 +486,44 @@ export function createDispatcher(options) {
   return {
     server,
     pref,
+    candidates: publicCandidates,
     listen() {
       return new Promise((resolve, reject) => {
-        server.once('error', reject);
-        server.listen(opts.listenPort, opts.listenHost, () => resolve(server.address()));
+        const onError = (err) => {
+          server.removeListener('error', onError);
+          reject(err);
+        };
+        server.once('error', onError);
+        server.listen(opts.listenPort, opts.listenHost, () => {
+          server.removeListener('error', onError);
+          resolve(server.address());
+        });
       });
     },
     close() {
       stopHealth();
-      return new Promise((resolve) => server.close(() => resolve()));
+      return new Promise((resolve) => {
+        let settled = false;
+        let timer;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve();
+        };
+        timer = setTimeout(() => {
+          for (const socket of sockets) {
+            try { socket.destroy(); } catch (e) { /* ignore */ }
+          }
+          sockets.clear();
+          finish();
+        }, opts.shutdownTimeoutMs);
+        if (timer.unref) timer.unref();
+        server.close(() => finish());
+      });
     },
     checkHealth,
+    runHealth,
     startHealth,
     stopHealth,
     getPreferred: () => preferred,

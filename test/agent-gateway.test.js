@@ -22,10 +22,14 @@ async function freePort() {
 }
 
 test('resolveAgent：已知 agent 映射到可执行文件', () => {
-  assert.equal(resolveAgent('claude').bin, 'claude');
-  assert.equal(resolveAgent('codex').bin, 'codex');
-  assert.equal(resolveAgent('gemini').bin, 'gemini');
-  assert.equal(resolveAgent('pi').bin, 'pi');
+  const expected = {
+    claude: 'claude', codex: 'codex', gemini: 'gemini', pi: 'pi',
+    aider: 'aider', opencode: 'opencode', qwen: 'qwen', cursor: 'cursor-agent',
+    droid: 'droid', amp: 'amp', crush: 'crush', goose: 'goose', copilot: 'copilot'
+  };
+  for (const [name, bin] of Object.entries(expected)) {
+    assert.equal(resolveAgent(name).bin, bin, name);
+  }
 });
 
 test('resolveAgent：不认识的 agent 返回 null', () => {
@@ -33,7 +37,7 @@ test('resolveAgent：不认识的 agent 返回 null', () => {
   assert.equal(resolveAgent(''), null);
 });
 
-test('buildProxyEnv：四个大小写变量 + 本地绕过，无关变量原样保留', () => {
+test('buildProxyEnv：代理变量大小写各一份 + 本地绕过，无关变量原样保留', () => {
   const env = buildProxyEnv('http://127.0.0.1:7898', { PATH: '/usr/bin', FOO: 'bar' });
   for (const key of ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy']) {
     assert.equal(env[key], 'http://127.0.0.1:7898', key);
@@ -42,6 +46,18 @@ test('buildProxyEnv：四个大小写变量 + 本地绕过，无关变量原样�
   assert.match(env.no_proxy, /localhost/);
   assert.equal(env.PATH, '/usr/bin');
   assert.equal(env.FOO, 'bar');
+});
+
+test('buildProxyEnv：socks ALL_PROXY 被替换，NO_PROXY 合并不覆盖', () => {
+  const env = buildProxyEnv('http://127.0.0.1:7898', {
+    ALL_PROXY: 'socks://127.0.0.1:12334/',
+    all_proxy: 'socks://127.0.0.1:12334/',
+    NO_PROXY: 'localhost,192.168.0.0/16'
+  });
+  assert.equal(env.ALL_PROXY, 'http://127.0.0.1:7898');
+  assert.equal(env.all_proxy, 'http://127.0.0.1:7898');
+  assert.match(env.NO_PROXY, /192\.168\.0\.0\/16/);
+  assert.equal(env.no_proxy, env.NO_PROXY);
 });
 
 test('proxyUrl：拼出回环地址', () => {

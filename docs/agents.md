@@ -9,12 +9,36 @@ agent-gateway run <agent>   →   起双路代理 + 把代理变量塞进子进�
 端口已被占用时复用那一个；子进程退出后代理跟着关，不留孤儿进程。agent 的本地端口
 （hook、LSP、语言服务器）走 `NO_PROXY` 直连，不会被代理吞掉。
 
+注入时会替换启动环境里的 socks `ALL_PROXY`：不少客户端会优先读它，留着就绕过了
+`HTTP(S)_PROXY`，双路选路白做。`NO_PROXY` 与用户原有的直连段合并，不覆盖。
+
 ```bash
 node bin/agent-gateway.js run claude --resume
 node bin/agent-gateway.js run codex
 node bin/agent-gateway.js run --listen-port 12334 --health-url https://api.deepseek.com -- gemini
 node bin/agent-gateway.js env   # 打印 export 语句，给不支持启动器的场景用
 ```
+
+内置短名只是「名字 → 可执行文件」的映射，真正的适配仍然是环境变量：
+
+| 短名 | 可执行文件 | 说明 |
+| :--- | :--- | :--- |
+| `claude` | `claude` | Claude Code |
+| `codex` | `codex` | OpenAI Codex CLI |
+| `gemini` | `gemini` | Gemini CLI |
+| `pi` | `pi` | pi |
+| `aider` | `aider` | Aider |
+| `opencode` | `opencode` | OpenCode |
+| `qwen` | `qwen` | Qwen Code |
+| `cursor` | `cursor-agent` | Cursor CLI |
+| `droid` | `droid` | Factory Droid |
+| `amp` | `amp` | Amp |
+| `crush` | `crush` | Charm Crush |
+| `goose` | `goose` | Goose |
+| `copilot` | `copilot` | GitHub Copilot CLI |
+
+不在表里的 CLI 用 `agent-gateway run -- <cmd> [args...]`，效果一样。客户端不读环境变量时，
+这一层无能为力——见下面的排查提示。
 
 ## Claude Code
 
@@ -25,7 +49,8 @@ node bin/agent-gateway.js env   # 打印 export 语句，给不支持启动器�
   "env": {
     "HTTPS_PROXY": "http://127.0.0.1:7898",
     "HTTP_PROXY": "http://127.0.0.1:7898",
-    "NO_PROXY": "localhost,127.0.0.1,::1"
+    "ALL_PROXY": "http://127.0.0.1:7898",
+    "NO_PROXY": "localhost,127.0.0.1,::1,[::1]"
   }
 }
 ```

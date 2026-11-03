@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createDispatcher } from '../src/server.js';
-import { startTarget, startFakeProxy, startSilent, startEcho, closedPort, tunnelVia } from './helpers.js';
+import { startTarget, startSlowTarget, startFakeProxy, startSilent, startEcho, closedPort, tunnelVia } from './helpers.js';
 
 const silent = () => {};
 
@@ -114,5 +114,26 @@ test('网关失败会立刻触发健康检查，把首选换到能用的那条',
     await stalled.close();
     await echo.close();
     await target.close();
+  }
+});
+
+test('健康检查：并发触发只跑一次', async () => {
+  const slow = await startSlowTarget(150);
+  const dead = await closedPort();
+  const d = createDispatcher({
+    listenPort: 0,
+    upstreamPort: dead,
+    healthUrl: 'http://127.0.0.1:' + slow.port + '/health',
+    healthIntervalMs: 60000,
+    attemptTimeoutMs: 500,
+    log: silent
+  });
+  await d.listen();
+  try {
+    await Promise.all([d.runHealth(), d.runHealth(), d.runHealth()]);
+    assert.equal(slow.count(), 1, '同一时刻只应有一次探测');
+  } finally {
+    await d.close();
+    await slow.close();
   }
 });

@@ -2,6 +2,8 @@
 
 一个本地 HTTP/HTTPS 代理：在若干候选网关（配置的上游、额外指定的代理、启动环境里的 HTTP(S)_PROXY、直连）之间自动选一条能到达目标的路；443 上先做 TLS 可达性探测，再用一个真实请求定期验证「到模型端点」的通道，把验证通过的网关设为首选。每个 host 记住最近走通的路，命中缓存就跳过诊断。
 
+要求 Node.js ≥ 22.19.0（undici 8 的要求）。
+
 两种用法，同一份核心：
 
 - **独立进程**：`dual-proxy` 跑一个常驻代理，或挂 systemd 用户服务；
@@ -24,11 +26,16 @@
 
 ## 行为
 
-- 候选网关 = `upstreamHost:upstreamPort` + `gateways` + 启动环境的 `HTTP(S)_PROXY`/`ALL_PROXY`，去重并排除自身监听端口，最后补 `direct`。
-- **CONNECT（HTTPS）**：443 上先对候选做 TLS 握手探测，通过的才用来开隧道；失败换下一条。
-- **普通 HTTP**：请求体先缓冲（上限 8 MB），按同一顺序换路重放。
-- **健康检查**：每 `healthIntervalMs` 用 `GET healthUrl` 验证一次通道，`<500` 就算通（401/403 说明端点活着）；通过者设为全局首选，全部失败则清掉首选、下次请求重新扫描。设为 `0` 关闭。
-- **每 host 偏好缓存**（默认 60 秒）：缓存命中跳过探测；失败即切换。
+- 候选网关 = `upstreamUrl`（或 `upstreamHost:upstreamPort`）+ `gateways` + 启动环境的 `HTTP(S)_PROXY`/`ALL_PROXY`，去重并排除自身监听端口，最后补 `direct`。
+- **上游代理认证**：`upstreamUrl`、`gateways` 或环境代理 URL 可带 `user:pass`，连接时带 `Proxy-Authorization: Basic`。只支持 `http://` 上游；`https://` 会报错或跳过，非法候选给脱敏 warning 后不参与选路。
+- **CONNECT（HTTPS）**：443 上先对候选做 TLS 握手探测，通过的才用来开隧道；失败换下一条。隧道建立后只转发字节，不再换路。
+- **普通 HTTP**：请求体先缓冲（上限 8 MB），按同一顺序换路重放。建连用 `attemptTimeoutMs`（已知路径用 `fastFailTimeoutMs`），等响应头用 `responseTimeoutMs`（默认 60 秒），响应体开始流之后不再计时。
+- **重放策略**：连接还没建立时任何方法都可换路；连接建立后只重放幂等方法（`GET`/`HEAD`/`OPTIONS`/`TRACE`/`PUT`/`DELETE`），`POST`/`PATCH` 默认回 502（可能已送达）。打开 `retryNonIdempotentWithIdempotencyKey` 后，带非空 `Idempotency-Key`/`X-Idempotency-Key` 的请求才允许发送后重放；`retryNonIdempotentAfterSend` 恢复对所有非幂等请求的发送后重放（危险，默认关）。
+- **407**：上游代理拒绝认证时视为该网关失败并换下一条，不把 407 转发给客户端。
+- **逐跳标头**按 RFC 9110 过滤（含 `Connection` 点名的字段），请求方向重写 `Host`。
+- **健康检查**：每 `healthIntervalMs` 用 `GET healthUrl` 验证一次通道，`<500` 就算通（401/403 说明端点活着）；通过者设为全局首选，全部失败则清掉首选、下次请求重新扫描。设为 `0` 关闭；周期检查与失败踢动不会并发探测。
+- **每 host 偏好缓存**（默认 60 秒，最多 1000 条，LRU 淘汰）：缓存命中跳过探测；失败即切换。
+- **关闭**最多等 `shutdownTimeoutMs`（默认 1.5 秒）让在途请求结束，超时后强制断开所有 socket。
 - **已知路径快失败**：缓存或健康首选的那一条只用 `fastFailTimeoutMs`（默认 2 秒）建连，挂了立刻换下一条，其余候选仍用完整超时。
 - **失败网关冷却**（默认 30 秒）：某条路失败后进入冷却，期间排到最后，别的 host 不会再先撞它；健康检查证明它恢复时自动解除。
 - **失败即复检**：任何一条路刚失败就踢一次健康检查（1 秒内只踢一次），不用等下一个 60 秒周期。
@@ -50,22 +57,26 @@ node bin/dual-proxy.js --listen-port 7898      # 没装到 PATH 时直接跑
 | `--listen-port` | `7898` | 监听端口 |
 | `--upstream-host` | `127.0.0.1` | 第一个候选网关 |
 | `--upstream-port` | `7897` | 第一个候选网关的端口 |
+| `--upstream-url` | — | 第一个候选的完整 URL，可含 `user:pass`；非空时覆盖 host/port |
 | `--gateway` | — | 额外候选网关，可重复 |
 | `--health-url` | 空 | 通道验证地址 |
 | `--health-interval-ms` | `60000` | 健康检查间隔，`0` 关闭 |
 | `--fast-fail-ms` | `2000` | 已知路径的建连超时 |
 | `--cooldown-ms` | `30000` | 失败网关的冷却时长 |
 | `--timeout-ms` | `5000` | 每次尝试/探测超时 |
+| `--response-timeout-ms` | `60000` | 普通 HTTP 等响应头的上限 |
 | `--pref-ttl-ms` | `60000` | 每 host 偏好缓存 TTL |
 | `--no-verify-tls` | 关 | 跳过 443 的 TLS 探测 |
+| `--retry-non-idempotent-after-send` | 关 | 连接建立后失败也重放 POST/PATCH（危险） |
+| `--retry-non-idempotent-with-idempotency-key` | 关 | 带幂等键时允许发送后重放 |
 
-环境变量同名（`LISTEN_HOST`、`LISTEN_PORT`、`UPSTREAM_HOST`、`UPSTREAM_PORT`、`GATEWAY`、`HEALTH_URL`、`HEALTH_INTERVAL_MS`、`FAST_FAIL_MS`、`COOLDOWN_MS`、`ATTEMPT_TIMEOUT_MS`、`PREF_TTL_MS`、`VERIFY_TLS=0`）。
+环境变量同名（`LISTEN_HOST`、`LISTEN_PORT`、`UPSTREAM_HOST`、`UPSTREAM_PORT`、`UPSTREAM_URL`、`GATEWAY`、`HEALTH_URL`、`HEALTH_INTERVAL_MS`、`FAST_FAIL_MS`、`COOLDOWN_MS`、`ATTEMPT_TIMEOUT_MS`、`RESPONSE_TIMEOUT_MS`、`PREF_TTL_MS`、`VERIFY_TLS=0`、`RETRY_NON_IDEMPOTENT_AFTER_SEND=1`、`RETRY_NON_IDEMPOTENT_WITH_IDEMPOTENCY_KEY=1`）。
 
 systemd 用户服务模板在 `contrib/`。
 
 ## 给主流 CLI agent 用
 
-Claude Code / Codex CLI / Gemini CLI / pi 没有共用的插件 API，只有 `HTTP(S)_PROXY` 通杀：
+Claude Code / Codex CLI / Gemini CLI / aider / OpenCode / Cursor CLI 等主流 agent 没有共用的插件 API，只有 `HTTP(S)_PROXY` 通杀（内置短名见 [docs/agents.md](docs/agents.md)）：
 
 ```bash
 agent-gateway run claude --resume   # 起代理 → 注入变量 → exec
@@ -73,7 +84,7 @@ agent-gateway env                   # 打印 export 语句
 agent-gateway run -- <任意命令>      # 不限上表
 ```
 
-端口被占用就复用现有监听；子进程退出时代理跟着关。各家细节见 [docs/agents.md](docs/agents.md)。
+端口被占用就复用现有监听；子进程退出时代理跟着关。注入时会替换启动环境里的 socks `ALL_PROXY`（否则部分客户端会绕开 `HTTP(S)_PROXY`），并把 `NO_PROXY` 与用户原有的直连段合并而不是覆盖。各家细节见 [docs/agents.md](docs/agents.md)。
 
 ## 测试
 
@@ -81,7 +92,7 @@ agent-gateway run -- <任意命令>      # 不限上表
 npm test
 ```
 
-用例覆盖：HTTP 直连回退、经假代理转发、多个网关时跳过不通的、两条都不通返回 502、CONNECT 直连隧道与经假代理隧道、缓存网关卡住时快失败换路、失败网关冷却后不再先撞、网关解析与去重（含自身端口排除）、健康检查的选择与失败、健康循环记住首选、失败踢一次健康检查，以及 AGENT 启动器的环境注入、退出码透传与端口复用。
+用例覆盖：HTTP 直连回退、经假代理转发、多个网关时跳过不通的、两条都不通返回 502、黑洞网关按超时换路、逐跳标头过滤、CONNECT 直连与经代理隧道、CONNECT 200 同包早期数据、IPv6 字面量、缓存网关卡住时快失败换路、失败网关冷却后不再先撞、关闭时强制断开在途隧道、网关解析去重与自身端口排除、上游认证（CONNECT/HTTP/健康检查/407）、幂等键重放策略、健康检查的选择与失败、健康循环重入锁、偏好缓存 LRU，以及 AGENT 启动器的环境注入（含 socks ALL_PROXY 替换与 NO_PROXY 合并）、退出码透传与端口复用。
 
 ## 边界
 

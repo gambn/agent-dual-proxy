@@ -1,6 +1,9 @@
 import net from 'node:net';
 import tls from 'node:tls';
 
+/** 挂在隧道 socket 上：CONNECT 200 之后同包到达的早期数据。 */
+export const LEFTOVER = Symbol('agent-dual-proxy.leftover');
+
 /** 隧道 socket 的通用参数：让死连接更快被发现，小包不被攒着发。 */
 function tune(sock) {
   try {
@@ -18,6 +21,8 @@ function tune(sock) {
 export function connectDirect(host, port, timeoutMs) {
   return new Promise((resolve) => {
     const sock = net.connect({ host, port });
+    // 兜底监听：超时/销毁后底层若再冒 error，不能变成未捕获异常
+    sock.on('error', () => {});
     let settled = false;
     const done = (value) => {
       if (settled) return;
@@ -44,6 +49,7 @@ export function connectDirect(host, port, timeoutMs) {
 export function connectViaProxy(upstream, host, port, timeoutMs) {
   return new Promise((resolve) => {
     const sock = net.connect({ host: upstream.host, port: upstream.port });
+    sock.on('error', () => {});
     let settled = false;
     const done = (value) => {
       if (settled) return;
@@ -58,17 +64,22 @@ export function connectViaProxy(upstream, host, port, timeoutMs) {
     let head = '';
     const onData = (chunk) => {
       head += chunk.toString('latin1');
-      if (head.indexOf('\r\n\r\n') === -1) {
+      const end = head.indexOf('\r\n\r\n');
+      if (end === -1) {
         if (head.length > 16384) done(null);
         return;
       }
       const statusLine = head.slice(0, head.indexOf('\r\n'));
-      if (/^HTTP\/1\.[01] 200\b/.test(statusLine)) {
-        tune(sock);
-        done(sock);
-      } else {
+      if (!/^HTTP\/1\.[01] 200\b/.test(statusLine)) {
         done(null);
+        return;
       }
+      // 200 之后同包到达的隧道数据（服务端先发言的 banner）留给调用方转交。
+      // 不能 unshift：socket 处于 flowing 模式，此刻没有 data 监听，数据会被丢掉。
+      const leftover = head.slice(end + 4);
+      if (leftover) sock[LEFTOVER] = Buffer.from(leftover, 'latin1');
+      tune(sock);
+      done(sock);
     };
     const onError = () => done(null);
     sock.on('data', onData);
@@ -76,6 +87,7 @@ export function connectViaProxy(upstream, host, port, timeoutMs) {
     sock.write(
       'CONNECT ' + host + ':' + port + ' HTTP/1.1\r\n' +
       'Host: ' + host + ':' + port + '\r\n' +
+      (upstream.auth ? 'Proxy-Authorization: ' + upstream.auth + '\r\n' : '') +
       'Proxy-Connection: keep-alive\r\n\r\n'
     );
   });
@@ -114,13 +126,23 @@ function tlsOver(sock, servername, timeoutMs) {
     };
     const timer = setTimeout(() => finish(null), timeoutMs);
     try {
-      client = tls.connect({ socket: sock, servername, rejectUnauthorized: false });
+      const options = { socket: sock, rejectUnauthorized: false };
+      // 目标是 IP 字面量时不要设 servername（Node 会报 DEP0123 并忽略）
+      if (net.isIP(servername) === 0) options.servername = servername;
+      client = tls.connect(options);
       client.once('secureConnect', () => finish(client));
       client.once('error', () => finish(null));
     } catch (e) {
       finish(null);
     }
   });
+}
+
+/** HTTP 请求行里的 Host：IPv6 加方括号，非默认端口带端口。 */
+export function hostHeader(host, port, secure) {
+  const name = net.isIP(host) === 6 ? '[' + host + ']' : host;
+  const defaultPort = secure ? 443 : 80;
+  return Number(port) === defaultPort ? name : name + ':' + port;
 }
 
 /**
@@ -164,7 +186,7 @@ export async function probeHttp(open, host, port, path, secure, timeoutMs) {
     target.on('error', onError);
     target.write(
       'GET ' + path + ' HTTP/1.1\r\n' +
-      'Host: ' + host + '\r\n' +
+      'Host: ' + hostHeader(host, port, secure) + '\r\n' +
       'User-Agent: agent-dual-proxy\r\n' +
       'Connection: close\r\n\r\n'
     );

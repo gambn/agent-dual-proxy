@@ -30,3 +30,20 @@ test('pref: 未设置过的 host 返回 null', () => {
   const pref = createPref(1000);
   assert.equal(pref.get('nope'), null);
 });
+
+test('pref：超过容量时淘汰最久未使用的条目', () => {
+  const p = createPref(60000, undefined, 2);
+  p.set('a', 'x');
+  p.set('b', 'y');
+  p.set('c', 'z');
+  assert.equal(p.size(), 2);
+  assert.equal(p.get('a'), null, '最老的条目应被淘汰');
+  assert.equal(p.get('b'), 'y');
+
+  // 访问会刷新顺序，此时 c 变成最久未使用
+  assert.equal(p.get('b'), 'y');
+  p.set('d', 'w');
+  assert.equal(p.get('c'), null);
+  assert.equal(p.get('b'), 'y');
+  assert.equal(p.get('d'), 'w');
+});

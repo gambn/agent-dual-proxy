@@ -3,14 +3,21 @@ import net from 'node:net';
 import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { createDispatcher } from '../src/server.js';
-import { resolveAgent, buildProxyEnv, proxyUrl } from '../src/agents.js';
+import { collectGateways, isLoopbackHost, resolveUpstream } from '../src/gateways.js';
+import { assertNode } from '../src/engines.js';
+import { AGENT_NAMES, resolveAgent, buildProxyEnv, proxyUrl } from '../src/agents.js';
 
 const require = createRequire(import.meta.url);
 const pkg = require('../package.json');
 
 const LAUNCHER_OPTS = [
-  '--listen-host', '--listen-port', '--upstream-host', '--upstream-port',
-  '--gateway', '--health-url', '--health-interval-ms', '--timeout-ms'
+  '--listen-host', '--listen-port', '--upstream-host', '--upstream-port', '--upstream-url',
+  '--gateway', '--health-url', '--health-interval-ms', '--timeout-ms', '--response-timeout-ms',
+  '--fast-fail-ms', '--cooldown-ms', '--pref-ttl-ms'
+];
+const FLAGS = [
+  '--no-verify-tls', '--retry-non-idempotent-after-send',
+  '--retry-non-idempotent-with-idempotency-key'
 ];
 
 function usage() {
@@ -22,33 +29,60 @@ function usage() {
     '  agent-gateway run [options] -- <cmd> [args...]',
     '  agent-gateway env [options]        # 打印可 source 的导出语句',
     '',
-    'Agents: claude, codex, gemini, pi',
+    'Agents: ' + AGENT_NAMES.join(', '),
     '',
     'Options:',
     '  --listen-host <host>        default 127.0.0.1',
     '  --listen-port <port>        default 7898',
     '  --upstream-host <host>      default 127.0.0.1',
     '  --upstream-port <port>      default 7897',
+    '  --upstream-url <url>        full upstream URL, may include user:pass',
     '  --gateway <host:port>       extra candidate gateway, repeatable',
     '  --health-url <url>          verify the channel with this URL, default off',
     '  --health-interval-ms <ms>   default 60000, 0 disables',
     '  --timeout-ms <ms>           per-attempt timeout, default 5000',
+    '  --response-timeout-ms <ms>  header wait for plain HTTP, default 60000',
+    '  --fast-fail-ms <ms>         timeout for the known path, default 2000',
+    '  --cooldown-ms <ms>          failed gateway rest, default 30000',
+    '  --pref-ttl-ms <ms>          per-host preference TTL, default 60000',
+    '  --no-verify-tls             skip the TLS reachability probe on 443',
+    '  --retry-non-idempotent-after-send  replay POST/PATCH after the body may have',
+    '                              been sent (dangerous; default off)',
+    '  --retry-non-idempotent-with-idempotency-key',
+    '                              replay POST/PATCH after send when Idempotency-Key is present',
     '  -h, --help',
     '  -v, --version',
     ''
   ].join('\n'));
 }
 
+/** 解析整数并校验范围；失败抛 Error，由顶层统一报一行。 */
+function integer(label, raw, min, max) {
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < min || value > max) {
+    throw new Error('invalid value for ' + label + ': ' + raw + ' (expected integer ' + min + '..' + max + ')');
+  }
+  return value;
+}
+
 function parseArgs(argv, env = process.env) {
   const opts = {
     listenHost: env.LISTEN_HOST || '127.0.0.1',
-    listenPort: Number(env.LISTEN_PORT || 7898),
+    listenPort: integer('LISTEN_PORT', env.LISTEN_PORT ?? 7898, 1, 65535),
     upstreamHost: env.UPSTREAM_HOST || '127.0.0.1',
-    upstreamPort: Number(env.UPSTREAM_PORT || 7897),
-    gateways: [],
+    upstreamPort: integer('UPSTREAM_PORT', env.UPSTREAM_PORT ?? 7897, 1, 65535),
+    upstreamUrl: env.UPSTREAM_URL || '',
+    attemptTimeoutMs: integer('ATTEMPT_TIMEOUT_MS', env.ATTEMPT_TIMEOUT_MS ?? 5000, 100, 60000),
+    responseTimeoutMs: integer('RESPONSE_TIMEOUT_MS', env.RESPONSE_TIMEOUT_MS ?? 60000, 100, 600000),
+    prefTtlMs: integer('PREF_TTL_MS', env.PREF_TTL_MS ?? 60000, 0, 3600000),
+    gateways: env.GATEWAY ? [env.GATEWAY] : [],
     healthUrl: env.HEALTH_URL || '',
-    healthIntervalMs: Number(env.HEALTH_INTERVAL_MS || 60000),
-    attemptTimeoutMs: Number(env.ATTEMPT_TIMEOUT_MS || 5000)
+    healthIntervalMs: integer('HEALTH_INTERVAL_MS', env.HEALTH_INTERVAL_MS ?? 60000, 0, 3600000),
+    fastFailTimeoutMs: integer('FAST_FAIL_MS', env.FAST_FAIL_MS ?? 2000, 100, 60000),
+    cooldownMs: integer('COOLDOWN_MS', env.COOLDOWN_MS ?? 30000, 0, 600000),
+    retryNonIdempotentAfterSend: env.RETRY_NON_IDEMPOTENT_AFTER_SEND === '1',
+    retryNonIdempotentWithIdempotencyKey: env.RETRY_NON_IDEMPOTENT_WITH_IDEMPOTENCY_KEY === '1',
+    verifyTls: env.VERIFY_TLS !== '0'
   };
   const rest = [];
   let explicit = false;
@@ -60,7 +94,7 @@ function parseArgs(argv, env = process.env) {
       explicit = true;
       break;
     }
-    if (!arg.startsWith('--')) {
+    if (!arg.startsWith('-')) {
       rest.push(...argv.slice(i));
       break;
     }
@@ -73,6 +107,16 @@ function parseArgs(argv, env = process.env) {
       usage();
       process.exit(0);
     }
+    if (arg === '--version' || arg === '-v') {
+      process.stdout.write(pkg.version + '\n');
+      process.exit(0);
+    }
+    if (FLAGS.includes(arg)) {
+      if (arg === '--no-verify-tls') opts.verifyTls = false;
+      else if (arg === '--retry-non-idempotent-after-send') opts.retryNonIdempotentAfterSend = true;
+      else if (arg === '--retry-non-idempotent-with-idempotency-key') opts.retryNonIdempotentWithIdempotencyKey = true;
+      continue;
+    }
     if (!LAUNCHER_OPTS.includes(arg)) {
       // 不认识的开关当作目标 agent 的参数（例如 claude 自己的 --resume）
       rest.push(...argv.slice(i));
@@ -80,13 +124,18 @@ function parseArgs(argv, env = process.env) {
     }
     const value = next();
     if (arg === '--listen-host') opts.listenHost = value;
-    else if (arg === '--listen-port') opts.listenPort = Number(value);
+    else if (arg === '--listen-port') opts.listenPort = integer(arg, value, 1, 65535);
     else if (arg === '--upstream-host') opts.upstreamHost = value;
-    else if (arg === '--upstream-port') opts.upstreamPort = Number(value);
+    else if (arg === '--upstream-port') opts.upstreamPort = integer(arg, value, 1, 65535);
+    else if (arg === '--upstream-url') opts.upstreamUrl = value;
     else if (arg === '--gateway') opts.gateways.push(value);
     else if (arg === '--health-url') opts.healthUrl = value;
-    else if (arg === '--health-interval-ms') opts.healthIntervalMs = Number(value);
-    else if (arg === '--timeout-ms') opts.attemptTimeoutMs = Number(value);
+    else if (arg === '--health-interval-ms') opts.healthIntervalMs = integer(arg, value, 0, 3600000);
+    else if (arg === '--timeout-ms') opts.attemptTimeoutMs = integer(arg, value, 100, 60000);
+    else if (arg === '--response-timeout-ms') opts.responseTimeoutMs = integer(arg, value, 100, 600000);
+    else if (arg === '--fast-fail-ms') opts.fastFailTimeoutMs = integer(arg, value, 100, 60000);
+    else if (arg === '--cooldown-ms') opts.cooldownMs = integer(arg, value, 0, 600000);
+    else if (arg === '--pref-ttl-ms') opts.prefTtlMs = integer(arg, value, 0, 3600000);
   }
 
   return { opts, rest, explicit };
@@ -103,26 +152,35 @@ function portInUse(host, port) {
 }
 
 async function serve(opts) {
+  const upstream = resolveUpstream(opts);
+  if (!isLoopbackHost(opts.listenHost)) {
+    process.stderr.write('warning: listening on ' + opts.listenHost + '; this proxy has no authentication\n');
+  }
   const url = proxyUrl(opts);
   if (await portInUse(opts.listenHost, opts.listenPort)) {
     process.stderr.write('[agent-gateway] reusing existing listener on ' + url + '\n');
     return { url, close: async () => {} };
   }
-  const dispatcher = createDispatcher({
-    listenHost: opts.listenHost,
-    listenPort: opts.listenPort,
-    upstreamHost: opts.upstreamHost,
-    upstreamPort: opts.upstreamPort,
-    gateways: opts.gateways,
-    healthUrl: opts.healthUrl,
-    healthIntervalMs: opts.healthIntervalMs,
-    attemptTimeoutMs: opts.attemptTimeoutMs,
-    log: (msg) => process.stderr.write('[agent-gateway] ' + msg + '\n')
+  // 启动环境里的 HTTP(S)_PROXY/ALL_PROXY 也是候选；self 排除自己。
+  const gateways = collectGateways({
+    upstream,
+    extra: opts.gateways,
+    env: process.env,
+    self: { host: opts.listenHost, port: opts.listenPort },
+    onInvalid: (subject, reason) => process.stderr.write('warning: ' + subject + ': ' + reason + '\n')
   });
-  await dispatcher.listen();
+  const dispatcher = createDispatcher(Object.assign({}, opts, {
+    upstreamHost: upstream.host,
+    upstreamPort: upstream.port,
+    upstreamAuth: upstream.auth,
+    gateways,
+    log: (msg) => process.stderr.write('[agent-gateway] ' + msg + '\n')
+  }));
+  const addr = await dispatcher.listen();
   dispatcher.startHealth();
-  process.stderr.write('[agent-gateway] listening on ' + url + '\n');
-  return { url, close: () => dispatcher.stopHealth() || dispatcher.close() };
+  const bound = proxyUrl({ listenHost: addr.address, listenPort: addr.port });
+  process.stderr.write('[agent-gateway] listening on ' + bound + '\n');
+  return { url: bound, close: () => dispatcher.stopHealth() || dispatcher.close() };
 }
 
 async function run(argv) {
@@ -140,7 +198,8 @@ async function run(argv) {
     target = { bin: rest[0], args: rest.slice(1) };
   } else {
     process.stderr.write('[agent-gateway] unknown agent: ' + rest[0]
-      + '\n  known: claude, codex, gemini, pi\n  or: agent-gateway run -- <cmd> [args...]\n');
+      + '\n  known: ' + AGENT_NAMES.join(', ')
+      + '\n  or: agent-gateway run -- <cmd> [args...]\n');
     process.exit(2);
   }
 
@@ -159,26 +218,44 @@ async function run(argv) {
     stop(127);
   });
   child.on('exit', (code, signal) => stop(code === null ? 128 + (signal ? 1 : 0) : code));
+
+  // 让 agent 自己收尾，等它的 exit 事件再关代理，避免留下孤儿进程
+  for (const signal of ['SIGINT', 'SIGTERM']) {
+    process.on(signal, () => {
+      try { child.kill(signal); } catch (e) { /* ignore */ }
+    });
+  }
 }
 
 async function printEnv(argv) {
   const { opts } = parseArgs(argv);
-  const env = buildProxyEnv(proxyUrl(opts), {});
-  const keys = ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'NO_PROXY', 'no_proxy'];
+  // 以当前 shell 环境为底：NO_PROXY 会把用户原有的直连段一起带出去
+  const env = buildProxyEnv(proxyUrl(opts));
+  const keys = ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'ALL_PROXY', 'all_proxy', 'NO_PROXY', 'no_proxy'];
   process.stdout.write(keys.map((key) => 'export ' + key + '=' + env[key]).join('\n') + '\n');
 }
 
-const [command, ...rest] = process.argv.slice(2);
-if (command === '-h' || command === '--help' || command === undefined) {
-  usage();
-} else if (command === '-v' || command === '--version') {
-  process.stdout.write(pkg.version + '\n');
-} else if (command === 'run') {
-  await run(rest);
-} else if (command === 'env') {
-  await printEnv(rest);
-} else {
-  process.stderr.write('[agent-gateway] unknown command: ' + command + '\n');
-  usage();
-  process.exit(2);
+async function main() {
+  try {
+    assertNode();
+    const [command, ...rest] = process.argv.slice(2);
+    if (command === '-h' || command === '--help' || command === undefined) {
+      usage();
+    } else if (command === '-v' || command === '--version') {
+      process.stdout.write(pkg.version + '\n');
+    } else if (command === 'run') {
+      await run(rest);
+    } else if (command === 'env') {
+      await printEnv(rest);
+    } else {
+      process.stderr.write('[agent-gateway] unknown command: ' + command + '\n');
+      usage();
+      process.exit(2);
+    }
+  } catch (err) {
+    process.stderr.write((err && err.message ? err.message : String(err)) + '\n');
+    process.exitCode = 2;
+  }
 }
+
+main();
