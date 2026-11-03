@@ -28,9 +28,12 @@
     "bin",
     "src",
     "README.md",
+    "README.en.md",
     "CHANGELOG.md",
+    "SECURITY.md",
     "LICENSE",
-    "docs"
+    "docs",
+    "contrib"
   ],
   "keywords": [
     "proxy",
