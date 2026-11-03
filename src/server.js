@@ -6,6 +6,10 @@ import { hasIdempotencyKey, isIdempotent, shouldRetryAfterSend } from './retry-p
 
 const DEFAULT_LOG = (msg) => process.stderr.write('[dual-proxy] ' + msg + '\n');
 
+/** 本地身份端点：端口复用前用来确认监听者确实是本代理。 */
+export const IDENTITY_PATH = '/__agent_dual_proxy__';
+export const IDENTITY_HEADER = 'x-agent-dual-proxy';
+
 /** 合并配置：显式传入的 undefined 不应覆盖默认值。 */
 export function mergeOptions(defaults, options) {
   const merged = Object.assign({}, defaults);
@@ -224,6 +228,11 @@ export function createDispatcher(options) {
   };
 
   const server = http.createServer((req, res) => {
+    if (req.method === 'GET' && req.url === IDENTITY_PATH) {
+      res.writeHead(200, { 'content-type': 'text/plain', [IDENTITY_HEADER]: '1' });
+      res.end('agent-dual-proxy\n');
+      return;
+    }
     let target;
     try {
       target = new URL(req.url);

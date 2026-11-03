@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.7.2
+
+### Changed
+
+- 移除未使用的 `undici` 依赖（本项目只用 Node 内置 `http`/`net`/`tls`）；Node 门槛从 `>=22.19.0` 降到 `>=22.0.0`。
+- `agent-gateway` 复用监听端口前先探测身份：只有本代理才复用；被其他程序占用时报错退出（退出码 1），不再把 agent 指向非代理端口。
+- 代理新增本地身份端点 `GET /__agent_dual_proxy__`，返回 `x-agent-dual-proxy: 1`，供端口复用探测与运维检查使用。
+
+### Tests
+
+- 新增身份端点、端口复用身份探测用例；更新 Node 门槛用例。
+
 ## 0.7.1
 
 ### Changed

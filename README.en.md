@@ -18,7 +18,7 @@ npm install -g agent-dual-proxy
 agent-gateway run claude --resume
 ```
 
-Requires Node.js ≥ 22.19.0. Built-in short names cover Claude Code, Codex CLI, Gemini CLI, Aider, OpenCode, Qwen Code, Cursor CLI, Droid, Amp, Crush, Goose, GitHub Copilot CLI, and pi; see [docs/agents.md](docs/agents.md) for the full table. For anything not listed, use `agent-gateway run -- <cmd> [args...]`.
+Requires Node.js ≥ 22.0.0. Built-in short names cover Claude Code, Codex CLI, Gemini CLI, Aider, OpenCode, Qwen Code, Cursor CLI, Droid, Amp, Crush, Goose, GitHub Copilot CLI, and pi; see [docs/agents.md](docs/agents.md) for the full table. For anything not listed, use `agent-gateway run -- <cmd> [args...]`.
 
 Install from source (optional):
 
@@ -109,7 +109,7 @@ agent-gateway run -- <any command>  # beyond the built-in table
 agent-gateway env                   # print export statements to source
 ```
 
-Injection replaces a socks `ALL_PROXY` inherited from the launch environment: many clients prefer it, and leaving it in place bypasses `HTTP(S)_PROXY`, defeating the whole point. `NO_PROXY` is merged with the user's existing bypasses rather than overwritten; loopback stays direct, so an agent's own local ports (hooks, LSP, language servers) are never swallowed by the proxy. If the port is already in use, the launcher reuses the existing listener; when the child exits, the proxy is closed and no orphan process is left behind. See [docs/agents.md](docs/agents.md) for per-agent details.
+Injection replaces a socks `ALL_PROXY` inherited from the launch environment: many clients prefer it, and leaving it in place bypasses `HTTP(S)_PROXY`, defeating the whole point. `NO_PROXY` is merged with the user's existing bypasses rather than overwritten; loopback stays direct, so an agent's own local ports (hooks, LSP, language servers) are never swallowed by the proxy. If the port already hosts agent-dual-proxy, the launcher reuses that listener; if another program owns it, the launcher exits with an error instead of pointing the agent at a non-proxy port. When the child exits, the proxy is closed and no orphan process is left behind. See [docs/agents.md](docs/agents.md) for per-agent details.
 
 ## Tests
 
@@ -119,7 +119,7 @@ npm test
 
 The suite runs from the repository or the source archive; run `npm install` once in the source directory before `npm test`. The npm package does not include `test/`, so it cannot be run from an installed package.
 
-The suite covers: HTTP direct fallback, forwarding through a fake proxy, skipping a dead gateway among several, 502 when every path fails, timeout-based failover from a black-hole gateway, hop-by-hop header filtering in both directions, upstream disconnects mid-response without crashing, CONNECT direct tunnels and fake-proxy tunnels, early data arriving with the CONNECT 200, IPv6 literals, fast-fail when a cached gateway stalls, cooldown after a failure, forced tunnel teardown on shutdown, gateway parsing/deduplication (including self-exclusion and self-loop protection), health-check selection and failure, the health loop remembering the favourite, failure kicking a health check, the health-check reentrancy lock, the preference-cache cap, CLI validation and exit codes, self-signed TLS probing, the non-idempotent replay policy (send boundary, method classes, switch, logs and cooldown), upstream proxy authentication (CONNECT/HTTP/health, 407), the idempotency-key replay switch (presence checks and logs), and the agent launcher's environment injection, exit-code passthrough, and port reuse.
+The suite covers: HTTP direct fallback, forwarding through a fake proxy, skipping a dead gateway among several, 502 when every path fails, timeout-based failover from a black-hole gateway, hop-by-hop header filtering in both directions, upstream disconnects mid-response without crashing, CONNECT direct tunnels and fake-proxy tunnels, early data arriving with the CONNECT 200, IPv6 literals, fast-fail when a cached gateway stalls, cooldown after a failure, forced tunnel teardown on shutdown, gateway parsing/deduplication (including self-exclusion and self-loop protection), health-check selection and failure, the health loop remembering the favourite, failure kicking a health check, the health-check reentrancy lock, the preference-cache cap, CLI validation and exit codes, self-signed TLS probing, the non-idempotent replay policy (send boundary, method classes, switch, logs and cooldown), upstream proxy authentication (CONNECT/HTTP/health, 407), the idempotency-key replay switch (presence checks and logs), and the agent launcher's environment injection, exit-code passthrough, and port-reuse identity probing.
 
 ## Boundaries
 

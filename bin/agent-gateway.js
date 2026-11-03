@@ -1,8 +1,10 @@
 #!/usr/bin/env node
-import net from 'node:net';
+import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
-import { createDispatcher } from '../src/server.js';
+import { realpathSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { createDispatcher, IDENTITY_HEADER, IDENTITY_PATH } from '../src/server.js';
 import { collectGateways, isLoopbackHost, resolveUpstream } from '../src/gateways.js';
 import { assertNode } from '../src/engines.js';
 import { AGENT_NAMES, resolveAgent, buildProxyEnv, proxyUrl } from '../src/agents.js';
@@ -56,11 +58,14 @@ function usage() {
   ].join('\n'));
 }
 
-/** 解析整数并校验范围；失败抛 Error，由顶层统一报一行。 */
+/** 参数错误：由顶层以退出码 2 结束。 */
+export class UsageError extends Error {}
+
+/** 解析整数并校验范围；失败抛 UsageError。 */
 function integer(label, raw, min, max) {
   const value = Number(raw);
   if (!Number.isInteger(value) || value < min || value > max) {
-    throw new Error('invalid value for ' + label + ': ' + raw + ' (expected integer ' + min + '..' + max + ')');
+    throw new UsageError('invalid value for ' + label + ': ' + raw + ' (expected integer ' + min + '..' + max + ')');
   }
   return value;
 }
@@ -100,7 +105,7 @@ function parseArgs(argv, env = process.env) {
     }
     const next = () => {
       i += 1;
-      if (i >= argv.length) throw new Error('missing value for ' + arg);
+      if (i >= argv.length) throw new UsageError('missing value for ' + arg);
       return argv[i];
     };
     if (arg === '--help' || arg === '-h') {
@@ -141,13 +146,33 @@ function parseArgs(argv, env = process.env) {
   return { opts, rest, explicit };
 }
 
-/** 端口上已经有东西在听就复用，别抢端口。 */
-// ponytail: 只判「有人在听」就复用，不验证它是不是本代理；跑错的监听会静默被当上游用。
-function portInUse(host, port) {
+/**
+ * 监听端口上是谁：free（没人听）、ours（本代理）、other（别的程序）。
+ *
+ * 只有 ours 才复用。别的程序占着端口时直接报错，不能把 agent 指向
+ * 一个根本不是代理的端口。
+ */
+export function probeListener(host, port, timeoutMs = 1500) {
+  const probeHost = host === '0.0.0.0' || host === '::' ? '127.0.0.1' : host;
   return new Promise((resolve) => {
-    const server = net.createServer();
-    server.once('error', (err) => resolve(err.code === 'EADDRINUSE'));
-    server.listen(port, host, () => server.close(() => resolve(false)));
+    let settled = false;
+    const done = (value) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    const req = http.get({
+      host: probeHost,
+      port,
+      path: IDENTITY_PATH,
+      timeout: timeoutMs,
+      agent: false
+    }, (res) => {
+      res.resume();
+      done(res.statusCode === 200 && res.headers[IDENTITY_HEADER] === '1' ? 'ours' : 'other');
+    });
+    req.on('timeout', () => req.destroy(new Error('probe timeout')));
+    req.on('error', (err) => done(err && err.code === 'ECONNREFUSED' ? 'free' : 'other'));
   });
 }
 
@@ -157,9 +182,14 @@ async function serve(opts) {
     process.stderr.write('warning: listening on ' + opts.listenHost + '; this proxy has no authentication\n');
   }
   const url = proxyUrl(opts);
-  if (await portInUse(opts.listenHost, opts.listenPort)) {
-    process.stderr.write('[agent-gateway] reusing existing listener on ' + url + '\n');
+  const existing = await probeListener(opts.listenHost, opts.listenPort);
+  if (existing === 'ours') {
+    process.stderr.write('[agent-gateway] reusing agent-dual-proxy on ' + url + '\n');
     return { url, close: async () => {} };
+  }
+  if (existing === 'other') {
+    throw new Error('listen port ' + opts.listenPort + ' is already in use by something that is not '
+      + 'agent-dual-proxy; stop it or choose another --listen-port');
   }
   // 启动环境里的 HTTP(S)_PROXY/ALL_PROXY 也是候选；self 排除自己。
   const gateways = collectGateways({
@@ -254,8 +284,20 @@ async function main() {
     }
   } catch (err) {
     process.stderr.write((err && err.message ? err.message : String(err)) + '\n');
-    process.exitCode = 2;
+    process.exitCode = err instanceof UsageError ? 2 : 1;
   }
 }
 
-main();
+/** 入口判断：npm 通过符号链接调用时，argv[1] 与真实路径不同，必须 realpath 比较。 */
+function isMain() {
+  if (!process.argv[1]) return false;
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch (err) {
+    return false;
+  }
+}
+
+if (isMain()) {
+  main();
+}

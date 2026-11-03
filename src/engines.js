@@ -1,5 +1,5 @@
-/** Node 版本门槛：undici 8 要求 >= 22.19.0。 */
-export const MIN_NODE = '22.19.0';
+/** Node 版本门槛：只用到内置 http/net/tls，跟随当前维护中的 LTS 主版本。 */
+export const MIN_NODE = '22.0.0';
 
 function parts(version) {
   return String(version)
@@ -17,7 +17,7 @@ export function nodeAtLeast(version, min = MIN_NODE) {
   return c >= z;
 }
 
-/** 低于门槛时抛出可读错误，避免在 undici 里报出看不懂的运行期错误。 */
+/** 低于门槛时抛出可读错误，避免在运行期报出看不懂的语法/API 错误。 */
 export function assertNode(version = process.versions.node) {
   if (!nodeAtLeast(version)) {
     throw new Error('agent-dual-proxy requires Node >= ' + MIN_NODE + ' (current ' + version + ')');

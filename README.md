@@ -18,7 +18,7 @@ npm install -g agent-dual-proxy
 agent-gateway run claude --resume
 ```
 
-要求 Node.js ≥ 22.19.0。内置短名覆盖 Claude Code、Codex CLI、Gemini CLI、Aider、OpenCode、Qwen Code、Cursor CLI、Droid、Amp、Crush、Goose、GitHub Copilot CLI 和 pi；完整对照见 [docs/agents.md](docs/agents.md)。不在表里的命令用 `agent-gateway run -- <cmd> [args...]`。
+要求 Node.js ≥ 22.0.0。内置短名覆盖 Claude Code、Codex CLI、Gemini CLI、Aider、OpenCode、Qwen Code、Cursor CLI、Droid、Amp、Crush、Goose、GitHub Copilot CLI 和 pi；完整对照见 [docs/agents.md](docs/agents.md)。不在表里的命令用 `agent-gateway run -- <cmd> [args...]`。
 
 从源码安装（可选）：
 
@@ -109,7 +109,7 @@ agent-gateway run -- <任意命令>      # 不限内置表
 agent-gateway env                   # 打印可 source 的 export 语句
 ```
 
-注入时会替换启动环境里的 socks `ALL_PROXY`：不少客户端会优先读它，留着就绕过了 `HTTP(S)_PROXY`，双路选路白做。`NO_PROXY` 与用户原有的直连段合并而不是覆盖；回环地址默认直连，agent 自己的本地端口（hook、LSP、语言服务器）不会被代理吞掉。端口已被占用时复用现有监听；子进程退出后代理跟着关，不留孤儿进程。各家细节见 [docs/agents.md](docs/agents.md)。
+注入时会替换启动环境里的 socks `ALL_PROXY`：不少客户端会优先读它，留着就绕过了 `HTTP(S)_PROXY`，双路选路白做。`NO_PROXY` 与用户原有的直连段合并而不是覆盖；回环地址默认直连，agent 自己的本地端口（hook、LSP、语言服务器）不会被代理吞掉。端口上已经有本代理时复用现有监听；被其他程序占用则报错退出，不会把 agent 指向一个非代理端口。子进程退出后代理跟着关，不留孤儿进程。各家细节见 [docs/agents.md](docs/agents.md)。
 
 ## 测试
 
@@ -119,7 +119,7 @@ npm test
 
 测试面向仓库或源码快照；首次先在源码目录 `npm install`，再 `npm test`。npm 包不含 `test/`，安装后不能直接跑这套用例。
 
-用例覆盖：HTTP 直连回退、经假代理转发、多个网关时跳过不通的、两条都不通返回 502、黑洞网关按超时换路、请求与响应两个方向的逐跳标头过滤、上游中途断开不带崩进程、CONNECT 直连隧道与经假代理隧道、CONNECT 200 同包早期数据、IPv6 字面量、缓存网关卡住时快失败换路、失败网关冷却后不再先撞、关闭时强制断开在途隧道、网关解析与去重（含自身端口排除与自环防护）、健康检查的选择与失败、健康循环记住首选、失败踢一次健康检查、健康检查重入锁、偏好缓存上限、CLI 参数校验与退出码、自签证书的 TLS 探测、非幂等重放策略（send 前后边界、方法分类、开关、日志与冷却）、上游代理认证（CONNECT/HTTP/健康检查、407）、带幂等键的发送后重放（开关/键存在性/日志），以及 AGENT 启动器的环境注入、退出码透传与端口复用。
+用例覆盖：HTTP 直连回退、经假代理转发、多个网关时跳过不通的、两条都不通返回 502、黑洞网关按超时换路、请求与响应两个方向的逐跳标头过滤、上游中途断开不带崩进程、CONNECT 直连隧道与经假代理隧道、CONNECT 200 同包早期数据、IPv6 字面量、缓存网关卡住时快失败换路、失败网关冷却后不再先撞、关闭时强制断开在途隧道、网关解析与去重（含自身端口排除与自环防护）、健康检查的选择与失败、健康循环记住首选、失败踢一次健康检查、健康检查重入锁、偏好缓存上限、CLI 参数校验与退出码、自签证书的 TLS 探测、非幂等重放策略（send 前后边界、方法分类、开关、日志与冷却）、上游代理认证（CONNECT/HTTP/健康检查、407）、带幂等键的发送后重放（开关/键存在性/日志），以及 AGENT 启动器的环境注入、退出码透传与端口复用的身份探测。
 
 ## 边界
 

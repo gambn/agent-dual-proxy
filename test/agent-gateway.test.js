@@ -2,8 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import net from 'node:net';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { createDispatcher } from '../src/server.js';
 import { resolveAgent, buildProxyEnv, proxyUrl } from '../src/agents.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -73,18 +74,47 @@ test('CLI run：把代理变量交给子进程，退出码透传', async () => {
   assert.equal(result.status, 7);
 });
 
-test('CLI run：端口已被占用时复用在跑的那一份，不报错', async () => {
+test('CLI run：端口被其他程序占用时报错退出，不启动 agent', async () => {
   const port = await freePort();
   const blocker = net.createServer();
   await new Promise((resolve) => blocker.listen(port, '127.0.0.1', resolve));
   try {
     const result = spawnSync(process.execPath, [
-      CLI, 'run', '--listen-port', String(port), '--', 'sh', '-c', 'printf %s "$HTTPS_PROXY"'
+      CLI, 'run', '--listen-port', String(port), '--', 'sh', '-c', 'printf SHOULD_NOT_RUN'
     ], { encoding: 'utf8', timeout: 15000 });
-    assert.equal(result.status, 0);
-    assert.equal(result.stdout.trim(), 'http://127.0.0.1:' + port);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /not agent-dual-proxy/);
+    assert.ok(!result.stdout.includes('SHOULD_NOT_RUN'), 'agent 不应被启动');
   } finally {
     await new Promise((resolve) => blocker.close(resolve));
+  }
+});
+
+/** 异步启动 CLI：父进程要留着事件循环给同进程里的代理响应身份探测。 */
+function runAsync(args) {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [CLI, ...args], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.on('exit', (code) => resolve({ status: code, stdout, stderr }));
+  });
+}
+
+test('CLI run：端口上是本代理时复用现有监听', async () => {
+  const port = await freePort();
+  const proxy = createDispatcher({ listenPort: port, upstreamPort: 1, log: () => {} });
+  await proxy.listen();
+  try {
+    const result = await runAsync([
+      'run', '--listen-port', String(port), '--', 'sh', '-c', 'printf %s "$HTTPS_PROXY"'
+    ]);
+    assert.equal(result.status, 0);
+    assert.equal(result.stdout.trim(), 'http://127.0.0.1:' + port);
+    assert.match(result.stderr, /reusing agent-dual-proxy/);
+  } finally {
+    await proxy.close();
   }
 });
 

@@ -1,6 +1,6 @@
 {
   "name": "agent-dual-proxy",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "description": "Local dual-path proxy for CLI agents: auto-selects a gateway that reaches the model endpoint, verifies the channel, fails over to direct",
   "license": "MIT",
   "type": "module",
@@ -27,11 +27,8 @@
     "test": "node --test test/*.test.js",
     "start": "node bin/dual-proxy.js"
   },
-  "dependencies": {
-    "undici": "8.12.3"
-  },
   "engines": {
-    "node": ">=22.19.0"
+    "node": ">=22.0.0"
   },
   "files": [
     "bin",
