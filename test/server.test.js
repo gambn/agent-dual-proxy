@@ -86,7 +86,7 @@ test('listen：端口占用时按 portFallback 自动退避并返回实际端口
   }
 });
 
-test('listen：EADDRINUSE 诊断包含监听者与 TIME-WAIT 两种提示', async () => {
+test('listen：EADDRINUSE 诊断区分 LISTEN 冲突', async () => {
   const holder = net.createServer();
   await new Promise((resolve) => holder.listen(0, '127.0.0.1', resolve));
   const busy = holder.address().port;
@@ -94,8 +94,8 @@ test('listen：EADDRINUSE 诊断包含监听者与 TIME-WAIT 两种提示', asyn
   try {
     await assert.rejects(() => d.listen(), (err) => {
       assert.equal(err.code, 'EADDRINUSE');
-      assert.match(err.message, /TIME-WAIT/);
-      assert.match(err.message, /--port-fallback/);
+      assert.match(err.message, /a process is listening/);
+      assert.match(err.message, /--listen-port/);
       return true;
     });
   } finally {

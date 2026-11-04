@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.4
+
+0.7.3 未发布的收尾版本：把 `EADDRINUSE` 诊断进一步区分为 LISTEN 冲突与 TIME-WAIT 冲突。
+
+### Changed
+
+- 监听失败时先探测端口：有进程在听 → 提示停掉该进程或换端口；没有监听者但有 TIME-WAIT → 提示 TIME-WAIT 及其约 60 秒的存活时间；探测不确定时两种都提示。
+
 ## 0.7.3
 
 ### Added

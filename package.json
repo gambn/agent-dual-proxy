@@ -1,6 +1,6 @@
 {
   "name": "agent-dual-proxy",
-  "version": "0.7.3",
+  "version": "0.7.4",
   "description": "Local dual-path proxy for CLI agents: auto-selects a gateway that reaches the model endpoint, verifies the channel, fails over to direct",
   "license": "MIT",
   "type": "module",

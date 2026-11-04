@@ -1,4 +1,5 @@
 import http from 'node:http';
+import net from 'node:net';
 import { connectDirect, connectViaProxy, probeTls, probeHttp, LEFTOVER } from './paths.js';
 import { createPref } from './pref.js';
 import { buildCandidates } from './gateways.js';
@@ -48,14 +49,41 @@ function sanitizeHeaders(headers, targetHost) {
   return Object.assign(stripHopByHop(headers), { host: targetHost });
 }
 
-/** EADDRINUSE 的可操作诊断：监听者与 TIME-WAIT 两种情况都提示。 */
-function listenDiagnostic(err, host, port, attempts) {
+/** 端口上是谁：listener（有进程在听）、timewait（无监听但有 TIME-WAIT）、unknown。 */
+function probeListenerKind(host, port, timeoutMs = 500) {
+  const target = host === '0.0.0.0' || host === '::' ? '127.0.0.1' : host;
+  return new Promise((resolve) => {
+    const sock = net.connect({ host: target, port });
+    let settled = false;
+    const done = (kind) => {
+      if (settled) return;
+      settled = true;
+      sock.destroy();
+      resolve(kind);
+    };
+    sock.setTimeout(timeoutMs, () => done('unknown'));
+    sock.once('connect', () => done('listener'));
+    sock.once('error', (err) => done(err && err.code === 'ECONNREFUSED' ? 'timewait' : 'unknown'));
+  });
+}
+
+/** EADDRINUSE 的可操作诊断：区分 LISTEN 冲突与 TIME-WAIT 冲突。 */
+function listenDiagnostic(err, host, port, attempts, kind) {
+  let detail;
+  if (kind === 'listener') {
+    detail = 'a process is listening on this port (check `ss -tln | grep :' + port + '`); stop it';
+  } else if (kind === 'timewait') {
+    detail = 'nothing is listening, but TIME-WAIT sockets created by another process block reuse even with '
+      + 'SO_REUSEADDR (check `ss -tan | grep :' + port + '`); they usually clear within ~60s';
+  } else {
+    detail = 'a process may be listening (check `ss -tln | grep :' + port + '`) or TIME-WAIT sockets may block '
+      + 'reuse (check `ss -tan | grep :' + port + '`)';
+  }
   const out = new Error(
-    'listen EADDRINUSE on ' + host + ':' + port + ' — a listener may own it '
-    + '(check `ss -tln | grep :' + port + '`), or TIME-WAIT sockets created by another process '
-    + 'can block reuse even with SO_REUSEADDR (check `ss -tan | grep :' + port + '`). '
-    + (attempts > 0 ? 'Tried ' + (attempts + 1) + ' ports. ' : '')
-    + 'Choose another --listen-port, or enable --port-fallback.'
+    'listen EADDRINUSE on ' + host + ':' + port + ' — ' + detail + '.'
+    + (attempts > 0 ? ' Tried ' + (attempts + 1) + ' ports.' : '')
+    + ' Choose another --listen-port'
+    + (kind === 'timewait' ? ' or enable --port-fallback.' : '.')
   );
   out.code = 'EADDRINUSE';
   out.cause = err;
@@ -532,7 +560,10 @@ export function createDispatcher(options) {
             return await listenOnce(port);
           } catch (err) {
             if (err.code !== 'EADDRINUSE') throw err;
-            if (attempt >= retries || port >= 65535) throw listenDiagnostic(err, opts.listenHost, port, attempt);
+            if (attempt >= retries || port >= 65535) {
+              const kind = await probeListenerKind(opts.listenHost, port);
+              throw listenDiagnostic(err, opts.listenHost, port, attempt, kind);
+            }
             log('listen: ' + port + ' is in use (EADDRINUSE), trying ' + (port + 1));
             port += 1;
           }
