@@ -56,6 +56,17 @@ function envValue(env, name) {
   return value === undefined || value === '' ? undefined : value;
 }
 
+/** URL 展示用：去掉 userinfo、查询串与 hash，避免 print-config 泄漏凭证。 */
+function redactUrl(value) {
+  if (!value) return null;
+  try {
+    const url = new URL(value);
+    return url.protocol + '//' + url.host + url.pathname;
+  } catch (err) {
+    return '<invalid>';
+  }
+}
+
 /** 解析整数并校验范围；失败抛 UsageError。 */
 function integer(label, raw, min, max) {
   const value = Number(raw);
@@ -164,7 +175,7 @@ async function main() {
         upstream: { host: upstream.host, port: upstream.port, auth: Boolean(upstream.auth) },
         gateways: gateways.map((g) => ({ host: g.host, port: g.port, auth: Boolean(g.auth) })),
         direct: true,
-        health: { url: opts.healthUrl || null, intervalMs: opts.healthIntervalMs },
+        health: { url: redactUrl(opts.healthUrl), intervalMs: opts.healthIntervalMs },
         timeouts: {
           attemptMs: opts.attemptTimeoutMs,
           responseMs: opts.responseTimeoutMs,

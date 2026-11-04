@@ -111,7 +111,7 @@ test('CLI：--print-config 输出生效配置且不泄漏凭证', () => {
     bin, '--print-config',
     '--upstream-url', 'http://alice:secret@127.0.0.1:8080',
     '--gateway', '127.0.0.1:12334',
-    '--health-url', 'https://api.deepseek.com',
+    '--health-url', 'http://alice:secret@health.local:8080/path?token=abc',
     '--port-fallback', '4'
   ], {
     encoding: 'utf8',
@@ -124,10 +124,11 @@ test('CLI：--print-config 输出生效配置且不泄漏凭证', () => {
   assert.equal(view.upstream.host, '127.0.0.1');
   assert.equal(view.upstream.port, 8080);
   assert.equal(view.upstream.auth, true);
-  assert.equal(view.health.url, 'https://api.deepseek.com');
+  assert.equal(view.health.url, 'http://health.local:8080/path');
   assert.ok(view.gateways.some((g) => g.port === 12334));
   assert.ok(!run.stdout.includes('alice'));
   assert.ok(!run.stdout.includes('secret'));
+  assert.ok(!run.stdout.includes('token'));
 });
 
 test('CLI：非法 upstreamUrl 以退出码 2 结束且不泄漏凭证（U16/U17）', () => {

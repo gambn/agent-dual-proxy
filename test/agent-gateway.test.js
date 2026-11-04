@@ -6,6 +6,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { createDispatcher } from '../src/server.js';
 import { resolveAgent, buildProxyEnv, proxyUrl } from '../src/agents.js';
+import { selectListener } from '../bin/agent-gateway.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const CLI = path.join(ROOT, 'bin', 'agent-gateway.js');
@@ -63,6 +64,61 @@ test('buildProxyEnv：socks ALL_PROXY 被替换，NO_PROXY 合并不覆盖', () 
 
 test('proxyUrl：拼出回环地址', () => {
   assert.equal(proxyUrl({ listenHost: '127.0.0.1', listenPort: 7898 }), 'http://127.0.0.1:7898');
+});
+
+test('selectListener：原端口被其他程序占用时直接报错，不启动', async () => {
+  let started = false;
+  const result = await selectListener({
+    host: '127.0.0.1',
+    port: 7898,
+    fallback: 3,
+    probe: async () => 'other',
+    start: async () => { started = true; }
+  });
+  assert.deepEqual(result, { kind: 'other', port: 7898 });
+  assert.equal(started, false);
+});
+
+test('selectListener：TIME-WAIT 时退避到下一个空闲端口并返回实际端口', async () => {
+  const started = [];
+  const result = await selectListener({
+    host: '127.0.0.1',
+    port: 7898,
+    fallback: 3,
+    probe: async () => 'free',
+    start: async (port) => {
+      started.push(port);
+      if (port === 7898) throw Object.assign(new Error('busy'), { code: 'EADDRINUSE' });
+      return { dispatcher: {}, addr: { address: '127.0.0.1', port } };
+    }
+  });
+  assert.equal(result.kind, 'started');
+  assert.equal(result.port, 7899);
+  assert.deepEqual(started, [7898, 7899]);
+});
+
+test('selectListener：退避目标是本代理时复用而不是重开', async () => {
+  const result = await selectListener({
+    host: '127.0.0.1',
+    port: 7898,
+    fallback: 3,
+    probe: async (host, port) => (port === 7898 ? 'free' : 'ours'),
+    start: async () => { throw Object.assign(new Error('busy'), { code: 'EADDRINUSE' }); }
+  });
+  assert.deepEqual(result, { kind: 'ours', port: 7899 });
+});
+
+test('selectListener：全部 TIME-WAIT 时抛出最后一次 EADDRINUSE', async () => {
+  await assert.rejects(
+    () => selectListener({
+      host: '127.0.0.1',
+      port: 7898,
+      fallback: 1,
+      probe: async () => 'free',
+      start: async () => { throw Object.assign(new Error('busy'), { code: 'EADDRINUSE' }); }
+    }),
+    (err) => err.code === 'EADDRINUSE'
+  );
 });
 
 test('CLI run：把代理变量交给子进程，退出码透传', async () => {

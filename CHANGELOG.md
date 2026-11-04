@@ -7,6 +7,19 @@
 ### Changed
 
 - 监听失败时先探测端口：有进程在听 → 提示停掉该进程或换端口；没有监听者但有 TIME-WAIT → 提示 TIME-WAIT 及其约 60 秒的存活时间；探测不确定时两种都提示。
+- 排查命令按平台给出：Windows 用 `Get-NetTCPConnection -LocalPort <port>`，其他平台仍用 `ss`。
+- `agent-gateway` 的端口退避改为逐端口判断：本代理复用、其他程序报错，只有无人监听且绑定失败（TIME-WAIT）才继续往后找。
+- 退避耗尽后的诊断提示 `Increase --port-fallback`，不再提示已经生效的 `enable`。
+
+### Fixed
+
+- 端口退避后按实际监听端口重建候选列表，避免把退避到的端口当成网关造成自环。
+- `--print-config` 的 health URL 去掉 userinfo、查询串和 hash，和网关凭证一样不输出敏感值。
+
+### Tests
+
+- 新增退避后自环防护、TIME-WAIT/unknown 诊断分支、退避耗尽文案、`portHints` 平台分支、`--print-config` health URL 脱敏用例。
+- `agent-gateway` 的端口选择抽成可注入的 `selectListener`，覆盖“其他程序报错 / TIME-WAIT 退避 / 本代理复用 / 全部失败”四条语义；总用例 125。
 
 ## 0.7.3
 

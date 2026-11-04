@@ -2,9 +2,25 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import net from 'node:net';
-import { createDispatcher, mergeOptions, IDENTITY_HEADER, IDENTITY_PATH } from '../src/server.js';
+import { createDispatcher, mergeOptions, portHints, IDENTITY_HEADER, IDENTITY_PATH } from '../src/server.js';
 
 const silent = () => {};
+
+/** 65000 以上避开本机滚动 TIME-WAIT 常用的临时端口段。 */
+function isFree(port) {
+  return new Promise((resolve) => {
+    const s = net.createServer();
+    s.once('error', () => resolve(false));
+    s.listen(port, '127.0.0.1', () => s.close(() => resolve(true)));
+  });
+}
+
+async function consecutiveHighPorts() {
+  for (let port = 62000; port < 62900; port += 2) {
+    if (await isFree(port) && await isFree(port + 1)) return port;
+  }
+  throw new Error('no consecutive free high ports');
+}
 
 test('mergeOptions：显式 undefined 不覆盖默认值', () => {
   const merged = mergeOptions({ prefTtlMs: 60000, attemptTimeoutMs: 5000 }, {
@@ -98,6 +114,106 @@ test('listen：EADDRINUSE 诊断区分 LISTEN 冲突', async () => {
       assert.match(err.message, /--listen-port/);
       return true;
     });
+  } finally {
+    await d.close();
+    await new Promise((resolve) => holder.close(resolve));
+  }
+});
+
+test('listen：TIME-WAIT 诊断分支（注入探测）', async () => {
+  const holder = net.createServer();
+  await new Promise((resolve) => holder.listen(0, '127.0.0.1', resolve));
+  const busy = holder.address().port;
+  const d = createDispatcher({
+    listenPort: busy,
+    portFallback: 0,
+    log: silent,
+    listenProbe: async () => 'timewait'
+  });
+  try {
+    await assert.rejects(() => d.listen(), (err) => {
+      assert.match(err.message, /nothing is listening/);
+      assert.match(err.message, /TIME-WAIT/);
+      assert.match(err.message, /--port-fallback/);
+      return true;
+    });
+  } finally {
+    await d.close();
+    await new Promise((resolve) => holder.close(resolve));
+  }
+});
+
+test('portHints：Windows 用 Get-NetTCPConnection，其他平台用 ss', () => {
+  assert.match(portHints(7898, 'win32').listen, /Get-NetTCPConnection -LocalPort 7898 -State Listen/);
+  assert.match(portHints(7898, 'win32').all, /Get-NetTCPConnection -LocalPort 7898/);
+  assert.match(portHints(7898, 'linux').listen, /ss -tln \| grep :7898/);
+  assert.match(portHints(7898, 'linux').all, /ss -tan \| grep :7898/);
+});
+
+test('listen：退避耗尽后的文案提示 increase，而不是 enable', async () => {
+  const base = await consecutiveHighPorts();
+  const first = net.createServer();
+  const second = net.createServer();
+  await new Promise((resolve) => first.listen(base, '127.0.0.1', resolve));
+  await new Promise((resolve) => second.listen(base + 1, '127.0.0.1', resolve));
+  const d = createDispatcher({
+    listenPort: base,
+    portFallback: 1,
+    log: silent,
+    listenProbe: async () => 'timewait'
+  });
+  try {
+    await assert.rejects(() => d.listen(), (err) => {
+      assert.match(err.message, /Increase --port-fallback/);
+      return true;
+    });
+  } finally {
+    await d.close();
+    await new Promise((resolve) => first.close(resolve));
+    await new Promise((resolve) => second.close(resolve));
+  }
+});
+
+test('listen：探测不确定时两种提示都给出', async () => {
+  const holder = net.createServer();
+  await new Promise((resolve) => holder.listen(0, '127.0.0.1', resolve));
+  const busy = holder.address().port;
+  const d = createDispatcher({
+    listenPort: busy,
+    portFallback: 0,
+    log: silent,
+    listenProbe: async () => 'unknown'
+  });
+  try {
+    await assert.rejects(() => d.listen(), (err) => {
+      assert.match(err.message, /may be listening/);
+      assert.match(err.message, /may block/);
+      return true;
+    });
+  } finally {
+    await d.close();
+    await new Promise((resolve) => holder.close(resolve));
+  }
+});
+
+test('listen：退避后实际端口不再出现在候选里（自环防护）', async () => {
+  const base = await consecutiveHighPorts();
+  const holder = net.createServer();
+  await new Promise((resolve) => holder.listen(base, '127.0.0.1', resolve));
+  const d = createDispatcher({
+    listenPort: base,
+    portFallback: 1,
+    upstreamPort: 1,
+    gateways: ['127.0.0.1:' + (base + 1)],
+    log: silent
+  });
+  try {
+    const addr = await d.listen();
+    assert.equal(addr.port, base + 1);
+    const ids = d.candidates.map((candidate) => candidate.id);
+    assert.ok(!ids.includes('127.0.0.1:' + (base + 1)), '实际监听端口不应作为候选');
+    assert.ok(ids.includes('127.0.0.1:1'));
+    assert.ok(ids.includes('direct'));
   } finally {
     await d.close();
     await new Promise((resolve) => holder.close(resolve));

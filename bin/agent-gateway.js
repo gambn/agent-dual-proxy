@@ -179,20 +179,34 @@ export function probeListener(host, port, timeoutMs = 1500) {
   });
 }
 
+/**
+ * 逐端口选择监听位置：
+ * - ours：复用现有本代理；
+ * - other：其他程序占用，交给调用方报错；
+ * - free 但 start 抛 EADDRINUSE：多半是 TIME-WAIT，继续尝试下一个。
+ */
+export async function selectListener({ host, port, fallback, probe = probeListener, start }) {
+  let lastErr = null;
+  for (let attempt = 0; attempt <= fallback; attempt += 1) {
+    const candidate = port + attempt;
+    if (candidate > 65535) break;
+    const kind = await probe(host, candidate);
+    if (kind === 'ours') return { kind: 'ours', port: candidate };
+    if (kind === 'other') return { kind: 'other', port: candidate };
+    try {
+      return { kind: 'started', port: candidate, server: await start(candidate) };
+    } catch (err) {
+      if (err.code !== 'EADDRINUSE') throw err;
+      lastErr = err;
+    }
+  }
+  throw lastErr || new Error('no usable listen port between ' + port + ' and ' + (port + fallback));
+}
+
 async function serve(opts) {
   const upstream = resolveUpstream(opts);
   if (!isLoopbackHost(opts.listenHost)) {
     process.stderr.write('warning: listening on ' + opts.listenHost + '; this proxy has no authentication\n');
-  }
-  const url = proxyUrl(opts);
-  const existing = await probeListener(opts.listenHost, opts.listenPort);
-  if (existing === 'ours') {
-    process.stderr.write('[agent-gateway] reusing agent-dual-proxy on ' + url + '\n');
-    return { url, close: async () => {} };
-  }
-  if (existing === 'other') {
-    throw new Error('listen port ' + opts.listenPort + ' is already in use by something that is not '
-      + 'agent-dual-proxy; stop it or choose another --listen-port');
   }
   // 启动环境里的 HTTP(S)_PROXY/ALL_PROXY 也是候选；self 排除自己。
   const gateways = collectGateways({
@@ -202,14 +216,37 @@ async function serve(opts) {
     self: { host: opts.listenHost, port: opts.listenPort },
     onInvalid: (subject, reason) => process.stderr.write('warning: ' + subject + ': ' + reason + '\n')
   });
-  const dispatcher = createDispatcher(Object.assign({}, opts, {
-    upstreamHost: upstream.host,
-    upstreamPort: upstream.port,
-    upstreamAuth: upstream.auth,
-    gateways,
-    log: (msg) => process.stderr.write('[agent-gateway] ' + msg + '\n')
-  }));
-  const addr = await dispatcher.listen();
+
+  const selection = await selectListener({
+    host: opts.listenHost,
+    port: opts.listenPort,
+    fallback: opts.portFallback,
+    start: async (port) => {
+      const dispatcher = createDispatcher(Object.assign({}, opts, {
+        listenHost: opts.listenHost,
+        listenPort: port,
+        portFallback: 0,
+        upstreamHost: upstream.host,
+        upstreamPort: upstream.port,
+        upstreamAuth: upstream.auth,
+        gateways,
+        log: (msg) => process.stderr.write('[agent-gateway] ' + msg + '\n')
+      }));
+      const addr = await dispatcher.listen();
+      return { dispatcher, addr };
+    }
+  });
+
+  if (selection.kind === 'other') {
+    throw new Error('listen port ' + selection.port + ' is already in use by something that is not '
+      + 'agent-dual-proxy; stop it or choose another --listen-port');
+  }
+  if (selection.kind === 'ours') {
+    const url = proxyUrl({ listenHost: opts.listenHost, listenPort: selection.port });
+    process.stderr.write('[agent-gateway] reusing agent-dual-proxy on ' + url + '\n');
+    return { url, close: async () => {} };
+  }
+  const { dispatcher, addr } = selection.server;
   dispatcher.startHealth();
   const bound = proxyUrl({ listenHost: addr.address, listenPort: addr.port });
   process.stderr.write('[agent-gateway] listening on ' + bound + '\n');
