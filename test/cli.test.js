@@ -99,6 +99,37 @@ test('CLI：upstreamUrl 解析与非法值脱敏（U16/U17/U19）', () => {
   assert.doesNotThrow(() => parseArgs(['--gateway', 'http://alice:secret@not a gateway'], {}));
 });
 
+test('CLI：--port-fallback 解析与范围校验', () => {
+  assert.equal(parseArgs(['--port-fallback', '5'], {}).portFallback, 5);
+  assert.equal(parseArgs([], { PORT_FALLBACK: '3' }).portFallback, 3);
+  assert.throws(() => parseArgs(['--port-fallback', '101'], {}), UsageError);
+  assert.throws(() => parseArgs(['--port-fallback', '-1'], {}), UsageError);
+});
+
+test('CLI：--print-config 输出生效配置且不泄漏凭证', () => {
+  const run = spawnSync(process.execPath, [
+    bin, '--print-config',
+    '--upstream-url', 'http://alice:secret@127.0.0.1:8080',
+    '--gateway', '127.0.0.1:12334',
+    '--health-url', 'https://api.deepseek.com',
+    '--port-fallback', '4'
+  ], {
+    encoding: 'utf8',
+    env: Object.assign({}, process.env, { LISTEN_PORT: '7898', PORT_FALLBACK: '' })
+  });
+  assert.equal(run.status, 0);
+  const view = JSON.parse(run.stdout);
+  assert.equal(view.listen.port, 7898);
+  assert.equal(view.listen.portFallback, 4);
+  assert.equal(view.upstream.host, '127.0.0.1');
+  assert.equal(view.upstream.port, 8080);
+  assert.equal(view.upstream.auth, true);
+  assert.equal(view.health.url, 'https://api.deepseek.com');
+  assert.ok(view.gateways.some((g) => g.port === 12334));
+  assert.ok(!run.stdout.includes('alice'));
+  assert.ok(!run.stdout.includes('secret'));
+});
+
 test('CLI：非法 upstreamUrl 以退出码 2 结束且不泄漏凭证（U16/U17）', () => {
   for (const args of [
     ['--upstream-url', 'https://alice:secret@proxy.local:8443'],

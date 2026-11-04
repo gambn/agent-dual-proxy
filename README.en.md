@@ -80,6 +80,8 @@ node bin/dual-proxy.js --listen-port 7898      # if it is not on PATH
 | :--- | :--- | :--- |
 | `--listen-host` | `127.0.0.1` | Listen address |
 | `--listen-port` | `7898` | Listen port |
+| `--port-fallback` | `0` | On EADDRINUSE, try port+1 up to this many times; `0` disables |
+| `--print-config` | — | Print the effective config and exit (alias `--dry-run`) |
 | `--upstream-host` | `127.0.0.1` | First candidate gateway |
 | `--upstream-port` | `7897` | Port of the first candidate |
 | `--upstream-url` | — | Full URL of the first candidate, may include `user:pass`; overrides host/port |
@@ -95,7 +97,7 @@ node bin/dual-proxy.js --listen-port 7898      # if it is not on PATH
 | `--retry-non-idempotent-after-send` | off | Also replay `POST`/`PATCH` after the connection was established |
 | `--retry-non-idempotent-with-idempotency-key` | off | Allow post-send replay when `Idempotency-Key` is present |
 
-Environment variables use the same names (`LISTEN_HOST`, `LISTEN_PORT`, `UPSTREAM_HOST`, `UPSTREAM_PORT`, `UPSTREAM_URL`, `GATEWAY`, `HEALTH_URL`, `HEALTH_INTERVAL_MS`, `FAST_FAIL_MS`, `COOLDOWN_MS`, `ATTEMPT_TIMEOUT_MS`, `RESPONSE_TIMEOUT_MS`, `PREF_TTL_MS`, `VERIFY_TLS=0`, `RETRY_NON_IDEMPOTENT_AFTER_SEND=1`, `RETRY_NON_IDEMPOTENT_WITH_IDEMPOTENCY_KEY=1`).
+Environment variables use the same names (`LISTEN_HOST`, `LISTEN_PORT`, `PORT_FALLBACK`, `UPSTREAM_HOST`, `UPSTREAM_PORT`, `UPSTREAM_URL`, `GATEWAY`, `HEALTH_URL`, `HEALTH_INTERVAL_MS`, `FAST_FAIL_MS`, `COOLDOWN_MS`, `ATTEMPT_TIMEOUT_MS`, `RESPONSE_TIMEOUT_MS`, `PREF_TTL_MS`, `VERIFY_TLS=0`, `RETRY_NON_IDEMPOTENT_AFTER_SEND=1`, `RETRY_NON_IDEMPOTENT_WITH_IDEMPOTENCY_KEY=1`).
 
 A systemd user-service template lives in `contrib/`.
 
@@ -109,7 +111,7 @@ agent-gateway run -- <any command>  # beyond the built-in table
 agent-gateway env                   # print export statements to source
 ```
 
-Injection replaces a socks `ALL_PROXY` inherited from the launch environment: many clients prefer it, and leaving it in place bypasses `HTTP(S)_PROXY`, defeating the whole point. `NO_PROXY` is merged with the user's existing bypasses rather than overwritten; loopback stays direct, so an agent's own local ports (hooks, LSP, language servers) are never swallowed by the proxy. If the port already hosts agent-dual-proxy, the launcher reuses that listener; if another program owns it, the launcher exits with an error instead of pointing the agent at a non-proxy port. When the child exits, the proxy is closed and no orphan process is left behind. See [docs/agents.md](docs/agents.md) for per-agent details.
+Injection replaces a socks `ALL_PROXY` inherited from the launch environment: many clients prefer it, and leaving it in place bypasses `HTTP(S)_PROXY`, defeating the whole point. `NO_PROXY` is merged with the user's existing bypasses rather than overwritten; loopback stays direct, so an agent's own local ports (hooks, LSP, language servers) are never swallowed by the proxy. If the port already hosts agent-dual-proxy, the launcher reuses that listener; if another program owns it, the launcher exits with an error instead of pointing the agent at a non-proxy port. If nothing is listening but the port is blocked by TIME-WAIT, the launcher steps forward up to 10 ports (`--port-fallback`) and injects the port it actually bound. When the child exits, the proxy is closed and no orphan process is left behind. See [docs/agents.md](docs/agents.md) for per-agent details.
 
 ## Tests
 
@@ -119,7 +121,14 @@ npm test
 
 The suite runs from the repository or the source archive; run `npm install` once in the source directory before `npm test`. The npm package does not include `test/`, so it cannot be run from an installed package.
 
-The suite covers: HTTP direct fallback, forwarding through a fake proxy, skipping a dead gateway among several, 502 when every path fails, timeout-based failover from a black-hole gateway, hop-by-hop header filtering in both directions, upstream disconnects mid-response without crashing, CONNECT direct tunnels and fake-proxy tunnels, early data arriving with the CONNECT 200, IPv6 literals, fast-fail when a cached gateway stalls, cooldown after a failure, forced tunnel teardown on shutdown, gateway parsing/deduplication (including self-exclusion and self-loop protection), health-check selection and failure, the health loop remembering the favourite, failure kicking a health check, the health-check reentrancy lock, the preference-cache cap, CLI validation and exit codes, self-signed TLS probing, the non-idempotent replay policy (send boundary, method classes, switch, logs and cooldown), upstream proxy authentication (CONNECT/HTTP/health, 407), the idempotency-key replay switch (presence checks and logs), and the agent launcher's environment injection, exit-code passthrough, and port-reuse identity probing.
+The suite covers: HTTP direct fallback, forwarding through a fake proxy, skipping a dead gateway among several, 502 when every path fails, timeout-based failover from a black-hole gateway, hop-by-hop header filtering in both directions, upstream disconnects mid-response without crashing, CONNECT direct tunnels and fake-proxy tunnels, early data arriving with the CONNECT 200, IPv6 literals, fast-fail when a cached gateway stalls, cooldown after a failure, forced tunnel teardown on shutdown, gateway parsing/deduplication (including self-exclusion and self-loop protection), health-check selection and failure, the health loop remembering the favourite, failure kicking a health check, the health-check reentrancy lock, the preference-cache cap, CLI validation and exit codes, self-signed TLS probing, the non-idempotent replay policy (send boundary, method classes, switch, logs and cooldown), upstream proxy authentication (CONNECT/HTTP/health, 407), the idempotency-key replay switch (presence checks and logs), and the agent launcher's environment injection, exit-code passthrough, port-reuse identity probing, port fallback and EADDRINUSE diagnostics, socks-warning deduplication, and `--print-config`.
+
+## Troubleshooting
+
+- **Nothing is listening, yet listen reports EADDRINUSE**: check `ss -tan | grep :7898`. Short-lived connections created by another process leave TIME-WAIT sockets on that port; if they were created without `SO_REUSEADDR`, a later binder cannot reuse the port even with Node's `reuseAddress` (the reuse bit is a two-way gate, not a plugin bug). Use another port, or `--port-fallback` to step forward; the log prints the actual port.
+- **`socks ... skipped` in the startup log**: only `http://` upstream proxies are supported, so `ALL_PROXY=socks://...` is skipped by design.
+- **Runtime logs go to stderr**: `dual-proxy` and `agent-gateway` write status logs to stderr; `agent-gateway env` writes export statements to stdout so they can be evaluated.
+- **Windows**: global npm commands are `.cmd`/`.ps1` shims; kill the `node.exe` that owns the port (`Get-NetTCPConnection -LocalPort 7898`) rather than the shim; `Start-Process` needs separate stdout and stderr redirections.
 
 ## Boundaries
 

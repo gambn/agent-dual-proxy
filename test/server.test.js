@@ -71,6 +71,39 @@ test('身份端点：GET /__agent_dual_proxy__ 返回本代理标记', async () 
   }
 });
 
+test('listen：端口占用时按 portFallback 自动退避并返回实际端口', async () => {
+  const holder = net.createServer();
+  await new Promise((resolve) => holder.listen(0, '127.0.0.1', resolve));
+  const busy = holder.address().port;
+  const d = createDispatcher({ listenPort: busy, portFallback: 5, log: silent });
+  try {
+    const addr = await d.listen();
+    assert.notEqual(addr.port, busy);
+    assert.ok(addr.port > busy && addr.port <= busy + 5, '应落在退避范围内');
+  } finally {
+    await d.close();
+    await new Promise((resolve) => holder.close(resolve));
+  }
+});
+
+test('listen：EADDRINUSE 诊断包含监听者与 TIME-WAIT 两种提示', async () => {
+  const holder = net.createServer();
+  await new Promise((resolve) => holder.listen(0, '127.0.0.1', resolve));
+  const busy = holder.address().port;
+  const d = createDispatcher({ listenPort: busy, portFallback: 0, log: silent });
+  try {
+    await assert.rejects(() => d.listen(), (err) => {
+      assert.equal(err.code, 'EADDRINUSE');
+      assert.match(err.message, /TIME-WAIT/);
+      assert.match(err.message, /--port-fallback/);
+      return true;
+    });
+  } finally {
+    await d.close();
+    await new Promise((resolve) => holder.close(resolve));
+  }
+});
+
 test('healthUrl 非法时按未配置处理，不抛', () => {
   const d = createDispatcher({ listenPort: 0, healthUrl: 'not a url', log: silent });
   assert.equal(d.server.listening, false);

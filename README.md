@@ -80,6 +80,8 @@ node bin/dual-proxy.js --listen-port 7898      # 没装到 PATH 时直接跑
 | :--- | :--- | :--- |
 | `--listen-host` | `127.0.0.1` | 监听地址 |
 | `--listen-port` | `7898` | 监听端口 |
+| `--port-fallback` | `0` | EADDRINUSE 时按端口 +1 依次重试的个数；`0` 关闭 |
+| `--print-config` | — | 打印最终生效配置后退出（别名 `--dry-run`） |
 | `--upstream-host` | `127.0.0.1` | 第一个候选网关 |
 | `--upstream-port` | `7897` | 第一个候选网关的端口 |
 | `--upstream-url` | — | 第一个候选的完整 URL，可含 `user:pass`；非空时覆盖 host/port |
@@ -95,7 +97,7 @@ node bin/dual-proxy.js --listen-port 7898      # 没装到 PATH 时直接跑
 | `--retry-non-idempotent-after-send` | 关 | 连接建立后失败时也重放 `POST`/`PATCH` |
 | `--retry-non-idempotent-with-idempotency-key` | 关 | 带 `Idempotency-Key` 时允许发送后重放 |
 
-环境变量同名（`LISTEN_HOST`、`LISTEN_PORT`、`UPSTREAM_HOST`、`UPSTREAM_PORT`、`UPSTREAM_URL`、`GATEWAY`、`HEALTH_URL`、`HEALTH_INTERVAL_MS`、`FAST_FAIL_MS`、`COOLDOWN_MS`、`ATTEMPT_TIMEOUT_MS`、`RESPONSE_TIMEOUT_MS`、`PREF_TTL_MS`、`VERIFY_TLS=0`、`RETRY_NON_IDEMPOTENT_AFTER_SEND=1`、`RETRY_NON_IDEMPOTENT_WITH_IDEMPOTENCY_KEY=1`）。
+环境变量同名（`LISTEN_HOST`、`LISTEN_PORT`、`PORT_FALLBACK`、`UPSTREAM_HOST`、`UPSTREAM_PORT`、`UPSTREAM_URL`、`GATEWAY`、`HEALTH_URL`、`HEALTH_INTERVAL_MS`、`FAST_FAIL_MS`、`COOLDOWN_MS`、`ATTEMPT_TIMEOUT_MS`、`RESPONSE_TIMEOUT_MS`、`PREF_TTL_MS`、`VERIFY_TLS=0`、`RETRY_NON_IDEMPOTENT_AFTER_SEND=1`、`RETRY_NON_IDEMPOTENT_WITH_IDEMPOTENCY_KEY=1`）。
 
 systemd 用户服务模板在 `contrib/`。
 
@@ -109,7 +111,7 @@ agent-gateway run -- <任意命令>      # 不限内置表
 agent-gateway env                   # 打印可 source 的 export 语句
 ```
 
-注入时会替换启动环境里的 socks `ALL_PROXY`：不少客户端会优先读它，留着就绕过了 `HTTP(S)_PROXY`，双路选路白做。`NO_PROXY` 与用户原有的直连段合并而不是覆盖；回环地址默认直连，agent 自己的本地端口（hook、LSP、语言服务器）不会被代理吞掉。端口上已经有本代理时复用现有监听；被其他程序占用则报错退出，不会把 agent 指向一个非代理端口。子进程退出后代理跟着关，不留孤儿进程。各家细节见 [docs/agents.md](docs/agents.md)。
+注入时会替换启动环境里的 socks `ALL_PROXY`：不少客户端会优先读它，留着就绕过了 `HTTP(S)_PROXY`，双路选路白做。`NO_PROXY` 与用户原有的直连段合并而不是覆盖；回环地址默认直连，agent 自己的本地端口（hook、LSP、语言服务器）不会被代理吞掉。端口上已经有本代理时复用现有监听；被其他程序占用则报错退出，不会把 agent 指向一个非代理端口。端口没有监听者却被 TIME-WAIT 卡住时，启动器默认往后找 10 个端口（`--port-fallback`），并在注入环境前使用实际绑定的端口。子进程退出后代理跟着关，不留孤儿进程。各家细节见 [docs/agents.md](docs/agents.md)。
 
 ## 测试
 
@@ -119,7 +121,14 @@ npm test
 
 测试面向仓库或源码快照；首次先在源码目录 `npm install`，再 `npm test`。npm 包不含 `test/`，安装后不能直接跑这套用例。
 
-用例覆盖：HTTP 直连回退、经假代理转发、多个网关时跳过不通的、两条都不通返回 502、黑洞网关按超时换路、请求与响应两个方向的逐跳标头过滤、上游中途断开不带崩进程、CONNECT 直连隧道与经假代理隧道、CONNECT 200 同包早期数据、IPv6 字面量、缓存网关卡住时快失败换路、失败网关冷却后不再先撞、关闭时强制断开在途隧道、网关解析与去重（含自身端口排除与自环防护）、健康检查的选择与失败、健康循环记住首选、失败踢一次健康检查、健康检查重入锁、偏好缓存上限、CLI 参数校验与退出码、自签证书的 TLS 探测、非幂等重放策略（send 前后边界、方法分类、开关、日志与冷却）、上游代理认证（CONNECT/HTTP/健康检查、407）、带幂等键的发送后重放（开关/键存在性/日志），以及 AGENT 启动器的环境注入、退出码透传与端口复用的身份探测。
+用例覆盖：HTTP 直连回退、经假代理转发、多个网关时跳过不通的、两条都不通返回 502、黑洞网关按超时换路、请求与响应两个方向的逐跳标头过滤、上游中途断开不带崩进程、CONNECT 直连隧道与经假代理隧道、CONNECT 200 同包早期数据、IPv6 字面量、缓存网关卡住时快失败换路、失败网关冷却后不再先撞、关闭时强制断开在途隧道、网关解析与去重（含自身端口排除与自环防护）、健康检查的选择与失败、健康循环记住首选、失败踢一次健康检查、健康检查重入锁、偏好缓存上限、CLI 参数校验与退出码、自签证书的 TLS 探测、非幂等重放策略（send 前后边界、方法分类、开关、日志与冷却）、上游代理认证（CONNECT/HTTP/健康检查、407）、带幂等键的发送后重放（开关/键存在性/日志），以及 AGENT 启动器的环境注入、退出码透传、端口复用的身份探测、端口退避与 EADDRINUSE 诊断、socks 告警去重、`--print-config`。
+
+## 排障
+
+- **端口没有监听者，listen 仍报 EADDRINUSE**：先看 `ss -tan | grep :7898`。同一端口上由别的进程建立过的短连接会留下 TIME-WAIT；如果它建立时没带 `SO_REUSEADDR`，后来者即使带 Node 的 `reuseAddress` 也绑不上（这是内核的双向门槛，不是插件 bug）。换端口，或用 `--port-fallback` 自动退避；日志会打印实际监听端口。
+- **启动日志出现 `socks ... skipped`**：上游只支持 `http://` 代理，`ALL_PROXY=socks://...` 会被跳过，这是预期行为。
+- **运行日志写 stderr**：`dual-proxy`/`agent-gateway` 的状态日志都走 stderr；`agent-gateway env` 的导出语句走 stdout，方便 `eval`。
+- **Windows**：npm 全局命令是 `.cmd`/`.ps1` shim，结束进程要杀真正持有端口的 `node.exe`（`Get-NetTCPConnection -LocalPort 7898`）；`Start-Process` 要分别重定向 stdout 与 stderr。
 
 ## 边界
 

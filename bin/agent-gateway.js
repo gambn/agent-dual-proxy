@@ -13,7 +13,7 @@ const require = createRequire(import.meta.url);
 const pkg = require('../package.json');
 
 const LAUNCHER_OPTS = [
-  '--listen-host', '--listen-port', '--upstream-host', '--upstream-port', '--upstream-url',
+  '--listen-host', '--listen-port', '--port-fallback', '--upstream-host', '--upstream-port', '--upstream-url',
   '--gateway', '--health-url', '--health-interval-ms', '--timeout-ms', '--response-timeout-ms',
   '--fast-fail-ms', '--cooldown-ms', '--pref-ttl-ms'
 ];
@@ -36,6 +36,7 @@ function usage() {
     'Options:',
     '  --listen-host <host>        default 127.0.0.1',
     '  --listen-port <port>        default 7898',
+    '  --port-fallback <n>         on EADDRINUSE try port+n, default 10 (0 disables)',
     '  --upstream-host <host>      default 127.0.0.1',
     '  --upstream-port <port>      default 7897',
     '  --upstream-url <url>        full upstream URL, may include user:pass',
@@ -74,6 +75,7 @@ function parseArgs(argv, env = process.env) {
   const opts = {
     listenHost: env.LISTEN_HOST || '127.0.0.1',
     listenPort: integer('LISTEN_PORT', env.LISTEN_PORT ?? 7898, 1, 65535),
+    portFallback: integer('PORT_FALLBACK', env.PORT_FALLBACK ?? 10, 0, 100),
     upstreamHost: env.UPSTREAM_HOST || '127.0.0.1',
     upstreamPort: integer('UPSTREAM_PORT', env.UPSTREAM_PORT ?? 7897, 1, 65535),
     upstreamUrl: env.UPSTREAM_URL || '',
@@ -130,6 +132,7 @@ function parseArgs(argv, env = process.env) {
     const value = next();
     if (arg === '--listen-host') opts.listenHost = value;
     else if (arg === '--listen-port') opts.listenPort = integer(arg, value, 1, 65535);
+    else if (arg === '--port-fallback') opts.portFallback = integer(arg, value, 0, 100);
     else if (arg === '--upstream-host') opts.upstreamHost = value;
     else if (arg === '--upstream-port') opts.upstreamPort = integer(arg, value, 1, 65535);
     else if (arg === '--upstream-url') opts.upstreamUrl = value;

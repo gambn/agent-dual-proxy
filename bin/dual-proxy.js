@@ -21,6 +21,8 @@ function usage() {
     'Options:',
     '  --listen-host <host>    default 127.0.0.1',
     '  --listen-port <port>    default 7898',
+    '  --port-fallback <n>     on EADDRINUSE try port+n, up to n ports, default 0',
+    '  --print-config          print the effective config and exit (alias: --dry-run)',
     '  --upstream-host <host>  default 127.0.0.1',
     '  --upstream-port <port>  default 7897',
     '  --upstream-url <url>    full upstream URL, may include user:pass',
@@ -40,8 +42,8 @@ function usage() {
     '  -h, --help              show this help',
     '  -v, --version           print version',
     '',
-    'Env fallbacks: LISTEN_HOST / LISTEN_PORT / UPSTREAM_HOST / UPSTREAM_PORT / UPSTREAM_URL /',
-    '               GATEWAY / HEALTH_URL / HEALTH_INTERVAL_MS / FAST_FAIL_MS /',
+    'Env fallbacks: LISTEN_HOST / LISTEN_PORT / PORT_FALLBACK / UPSTREAM_HOST / UPSTREAM_PORT /',
+    '               UPSTREAM_URL / GATEWAY / HEALTH_URL / HEALTH_INTERVAL_MS / FAST_FAIL_MS /',
     '               COOLDOWN_MS / ATTEMPT_TIMEOUT_MS / RESPONSE_TIMEOUT_MS /',
     '               PREF_TTL_MS / VERIFY_TLS=0 / RETRY_NON_IDEMPOTENT_AFTER_SEND=1 /',
     '               RETRY_NON_IDEMPOTENT_WITH_IDEMPOTENCY_KEY=1',
@@ -68,6 +70,7 @@ export function parseArgs(args, env = {}) {
   const opts = {
     listenHost: envValue(env, 'LISTEN_HOST') || '127.0.0.1',
     listenPort: integer('LISTEN_PORT', envValue(env, 'LISTEN_PORT') ?? 7898, 1, 65535),
+    portFallback: integer('PORT_FALLBACK', envValue(env, 'PORT_FALLBACK') ?? 0, 0, 100),
     upstreamHost: envValue(env, 'UPSTREAM_HOST') || '127.0.0.1',
     upstreamPort: integer('UPSTREAM_PORT', envValue(env, 'UPSTREAM_PORT') ?? 7897, 1, 65535),
     upstreamUrl: envValue(env, 'UPSTREAM_URL') || '',
@@ -94,6 +97,9 @@ export function parseArgs(args, env = {}) {
     switch (arg) {
       case '--listen-host': opts.listenHost = next(); break;
       case '--listen-port': opts.listenPort = integer(arg, next(), 1, 65535); break;
+      case '--port-fallback': opts.portFallback = integer(arg, next(), 0, 100); break;
+      case '--print-config':
+      case '--dry-run': opts.printConfig = true; break;
       case '--upstream-host': opts.upstreamHost = next(); break;
       case '--upstream-port': opts.upstreamPort = integer(arg, next(), 1, 65535); break;
       case '--upstream-url': opts.upstreamUrl = next(); break;
@@ -152,6 +158,29 @@ async function main() {
       self: { host: opts.listenHost, port: opts.listenPort },
       onInvalid: (subject, reason) => process.stderr.write('warning: ' + subject + ': ' + reason + '\n')
     });
+    if (opts.printConfig) {
+      const view = {
+        listen: { host: opts.listenHost, port: opts.listenPort, portFallback: opts.portFallback },
+        upstream: { host: upstream.host, port: upstream.port, auth: Boolean(upstream.auth) },
+        gateways: gateways.map((g) => ({ host: g.host, port: g.port, auth: Boolean(g.auth) })),
+        direct: true,
+        health: { url: opts.healthUrl || null, intervalMs: opts.healthIntervalMs },
+        timeouts: {
+          attemptMs: opts.attemptTimeoutMs,
+          responseMs: opts.responseTimeoutMs,
+          fastFailMs: opts.fastFailTimeoutMs
+        },
+        cooldownMs: opts.cooldownMs,
+        prefTtlMs: opts.prefTtlMs,
+        replay: {
+          nonIdempotentAfterSend: opts.retryNonIdempotentAfterSend,
+          idempotencyKey: opts.retryNonIdempotentWithIdempotencyKey
+        },
+        verifyTls: opts.verifyTls
+      };
+      process.stdout.write(JSON.stringify(view, null, 2) + '\n');
+      return;
+    }
     const dispatcher = createDispatcher(Object.assign({}, opts, {
       upstreamHost: upstream.host,
       upstreamPort: upstream.port,

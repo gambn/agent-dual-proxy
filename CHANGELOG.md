@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.7.3
+
+### Added
+
+- `--port-fallback <n>`：监听遇到 `EADDRINUSE` 时按端口 +1 依次重试，返回并打印实际绑定端口。`dual-proxy` 默认 `0`，`agent-gateway` 默认 `10`（它会在注入环境前回读实际端口）。
+- `dual-proxy --print-config`（别名 `--dry-run`）：输出生效配置、去重后的候选顺序与超时取值后退出，凭证只显示是否存在。
+- README 增加排障段：TIME-WAIT 占端口、socks 候选告警属预期、运行日志走 stderr、Windows shim 与进程结束方式。
+
+### Changed
+
+- `EADDRINUSE` 报错改为可操作诊断：提示分别用 `ss -tln` 和 `ss -tan` 检查监听者与 TIME-WAIT，并给出 `--listen-port` / `--port-fallback` 的下一步。
+- socks 上游候选的告警改为自解释文案（说明只支持 `http://`、`ALL_PROXY` 场景下属预期），并按脱敏值去重，大小写两份环境变量只报一次。
+
+### Notes
+
+- 已核实插件不会用固定源端口发探测/健康请求，不存在“自己制造 TIME-WAIT 堵自己”的自伤链。
+
 ## 0.7.2
 
 ### Changed

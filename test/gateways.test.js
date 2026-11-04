@@ -98,6 +98,22 @@ test('collectGateways：https/非法项给脱敏 warning，不静默丢弃', () 
   assert.match(warnings[1][1], /invalid gateway/);
 });
 
+test('collectGateways：socks 环境变量给自解释 warning，大小写重复只报一次', () => {
+  const warnings = [];
+  const list = collectGateways({
+    upstream: { host: '127.0.0.1', port: 7897 },
+    env: {
+      ALL_PROXY: 'socks://127.0.0.1:12334/',
+      all_proxy: 'socks://127.0.0.1:12334/'
+    },
+    onInvalid: (subject, reason) => warnings.push([subject, reason])
+  });
+  assert.deepEqual(list.map((g) => g.host + ':' + g.port), ['127.0.0.1:7897']);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0][1], /socks upstream is not supported/);
+  assert.match(warnings[0][1], /expected when ALL_PROXY is set/);
+});
+
 test('resolveUpstream：upstreamUrl 覆盖 host/port，空值沿用 host/port', () => {
   assert.deepEqual(resolveUpstream({ upstreamHost: '127.0.0.1', upstreamPort: 7897 }), {
     host: '127.0.0.1',

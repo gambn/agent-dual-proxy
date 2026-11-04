@@ -67,11 +67,14 @@ export function redactGateway(value) {
   }
 }
 
-/** 拒绝原因：https 与普通非法值分开，便于调用方给出可操作的提示。 */
+/** 拒绝原因：https/socks 与普通非法值分开，便于调用方给出可操作的提示。 */
 function rejectReason(value) {
-  return /^\s*https:\/\//i.test(String(value === undefined || value === null ? '' : value))
-    ? 'https upstream proxy is not supported'
-    : 'invalid gateway';
+  const text = String(value === undefined || value === null ? '' : value);
+  if (/^\s*https:\/\//i.test(text)) return 'https upstream proxy is not supported';
+  if (/^\s*socks[45h]?[a-z]*:\/\//i.test(text)) {
+    return 'socks upstream is not supported (only http:// proxies); skipped — expected when ALL_PROXY is set';
+  }
+  return 'invalid gateway';
 }
 
 /**
@@ -83,7 +86,12 @@ function rejectReason(value) {
  */
 export function collectGateways({ upstream, extra = [], env = {}, self, onInvalid } = {}) {
   const list = [];
+  // 同一个坏值常同时出现在大小写两份环境变量里（ALL_PROXY/all_proxy），只报一次
+  const warned = new Set();
   const warn = (subject, reason) => {
+    const key = subject + '\u0000' + reason;
+    if (warned.has(key)) return;
+    warned.add(key);
     if (typeof onInvalid === 'function') onInvalid(subject, reason);
   };
   const add = (gateway, raw) => {

@@ -48,6 +48,20 @@ function sanitizeHeaders(headers, targetHost) {
   return Object.assign(stripHopByHop(headers), { host: targetHost });
 }
 
+/** EADDRINUSE 的可操作诊断：监听者与 TIME-WAIT 两种情况都提示。 */
+function listenDiagnostic(err, host, port, attempts) {
+  const out = new Error(
+    'listen EADDRINUSE on ' + host + ':' + port + ' — a listener may own it '
+    + '(check `ss -tln | grep :' + port + '`), or TIME-WAIT sockets created by another process '
+    + 'can block reuse even with SO_REUSEADDR (check `ss -tan | grep :' + port + '`). '
+    + (attempts > 0 ? 'Tried ' + (attempts + 1) + ' ports. ' : '')
+    + 'Choose another --listen-port, or enable --port-fallback.'
+  );
+  out.code = 'EADDRINUSE';
+  out.cause = err;
+  return out;
+}
+
 /** 解析健康检查地址；只接受 http/https。 */
 function parseHealthUrl(value) {
   if (!value) return null;
@@ -94,6 +108,7 @@ export function createDispatcher(options) {
   const opts = mergeOptions({
     listenHost: '127.0.0.1',
     listenPort: 7898,
+    portFallback: 0,
     upstreamHost: '127.0.0.1',
     upstreamPort: 7897,
     gateways: [],
@@ -497,17 +512,32 @@ export function createDispatcher(options) {
     pref,
     candidates: publicCandidates,
     listen() {
-      return new Promise((resolve, reject) => {
+      const listenOnce = (port) => new Promise((resolve, reject) => {
         const onError = (err) => {
           server.removeListener('error', onError);
           reject(err);
         };
         server.once('error', onError);
-        server.listen(opts.listenPort, opts.listenHost, () => {
+        server.listen(port, opts.listenHost, () => {
           server.removeListener('error', onError);
           resolve(server.address());
         });
       });
+
+      const retries = Math.max(0, Math.floor(opts.portFallback || 0));
+      return (async () => {
+        let port = opts.listenPort;
+        for (let attempt = 0; ; attempt += 1) {
+          try {
+            return await listenOnce(port);
+          } catch (err) {
+            if (err.code !== 'EADDRINUSE') throw err;
+            if (attempt >= retries || port >= 65535) throw listenDiagnostic(err, opts.listenHost, port, attempt);
+            log('listen: ' + port + ' is in use (EADDRINUSE), trying ' + (port + 1));
+            port += 1;
+          }
+        }
+      })();
     },
     close() {
       stopHealth();
