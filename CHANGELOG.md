@@ -21,7 +21,7 @@
 
 - 新增 `test/rules.test.js`（解析、匹配、优先级、健康/缓存覆盖、健康检查 host 规则、CLI/env、双入口 print-config）与 `test/cooldown.test.js`（两档冷却、host 隔离、proxy-reset/TLS/phase 分类、流式 reset、fast-fail 的 known 边界、健康检查清理范围）。
 - 测试用 `createDispatcher` 第二个参数注入 `tlsProbePort` / `onAttempt`，不进入公开 options/CLI；fast-fail 断言改为检查实际 timeout，不依赖 wall clock。
-- 总用例 152；`rules.js` 行/分支 100%；项目级行覆盖 94.62%。
+- 总用例 152；`rules.js` 行/分支 100%；项目级行覆盖 94.64%。
 
 ## 0.7.4
 
