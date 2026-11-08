@@ -4,6 +4,7 @@ import { realpathSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { createDispatcher } from '../src/server.js';
 import { collectGateways, isLoopbackHost, resolveUpstream } from '../src/gateways.js';
+import { splitPatterns } from '../src/rules.js';
 import { assertNode } from '../src/engines.js';
 
 const require = createRequire(import.meta.url);
@@ -27,6 +28,8 @@ function usage() {
     '  --upstream-port <port>  default 7897',
     '  --upstream-url <url>    full upstream URL, may include user:pass',
     '  --gateway <host:port>   extra candidate gateway, repeatable',
+    '  --prefer-direct <patterns>  try direct first for these hosts (comma-separated, * glob)',
+    '  --prefer-proxy <patterns>   try proxies first for these hosts (comma-separated, * glob)',
     '  --health-url <url>      verify the channel with this URL, default off',
     '  --health-interval-ms <ms>  default 60000, 0 disables',
     '  --fast-fail-ms <ms>     timeout for the known path, default 2000',
@@ -43,8 +46,9 @@ function usage() {
     '  -v, --version           print version',
     '',
     'Env fallbacks: LISTEN_HOST / LISTEN_PORT / PORT_FALLBACK / UPSTREAM_HOST / UPSTREAM_PORT /',
-    '               UPSTREAM_URL / GATEWAY / HEALTH_URL / HEALTH_INTERVAL_MS / FAST_FAIL_MS /',
-    '               COOLDOWN_MS / ATTEMPT_TIMEOUT_MS / RESPONSE_TIMEOUT_MS /',
+    '               UPSTREAM_URL / GATEWAY / PREFER_DIRECT / PREFER_PROXY /',
+    '               HEALTH_URL / HEALTH_INTERVAL_MS / FAST_FAIL_MS / COOLDOWN_MS /',
+    '               ATTEMPT_TIMEOUT_MS / RESPONSE_TIMEOUT_MS /',
     '               PREF_TTL_MS / VERIFY_TLS=0 / RETRY_NON_IDEMPOTENT_AFTER_SEND=1 /',
     '               RETRY_NON_IDEMPOTENT_WITH_IDEMPOTENCY_KEY=1',
     ''
@@ -89,6 +93,8 @@ export function parseArgs(args, env = {}) {
     responseTimeoutMs: integer('RESPONSE_TIMEOUT_MS', envValue(env, 'RESPONSE_TIMEOUT_MS') ?? 60000, 100, 600000),
     prefTtlMs: integer('PREF_TTL_MS', envValue(env, 'PREF_TTL_MS') ?? 60000, 0, 3600000),
     gateways: envValue(env, 'GATEWAY') ? [envValue(env, 'GATEWAY')] : [],
+    preferDirect: splitPatterns(envValue(env, 'PREFER_DIRECT')),
+    preferProxy: splitPatterns(envValue(env, 'PREFER_PROXY')),
     healthUrl: env.HEALTH_URL ?? '',
     healthIntervalMs: integer('HEALTH_INTERVAL_MS', envValue(env, 'HEALTH_INTERVAL_MS') ?? 60000, 0, 3600000),
     fastFailTimeoutMs: integer('FAST_FAIL_MS', envValue(env, 'FAST_FAIL_MS') ?? 2000, 100, 60000),
@@ -115,6 +121,8 @@ export function parseArgs(args, env = {}) {
       case '--upstream-port': opts.upstreamPort = integer(arg, next(), 1, 65535); break;
       case '--upstream-url': opts.upstreamUrl = next(); break;
       case '--gateway': opts.gateways.push(next()); break;
+      case '--prefer-direct': opts.preferDirect.push(...splitPatterns(next())); break;
+      case '--prefer-proxy': opts.preferProxy.push(...splitPatterns(next())); break;
       case '--health-url': opts.healthUrl = next(); break;
       case '--health-interval-ms': opts.healthIntervalMs = integer(arg, next(), 0, 3600000); break;
       case '--fast-fail-ms': opts.fastFailTimeoutMs = integer(arg, next(), 100, 60000); break;
@@ -174,6 +182,8 @@ async function main() {
         listen: { host: opts.listenHost, port: opts.listenPort, portFallback: opts.portFallback },
         upstream: { host: upstream.host, port: upstream.port, auth: Boolean(upstream.auth) },
         gateways: gateways.map((g) => ({ host: g.host, port: g.port, auth: Boolean(g.auth) })),
+        preferDirect: opts.preferDirect,
+        preferProxy: opts.preferProxy,
         direct: true,
         health: { url: redactUrl(opts.healthUrl), intervalMs: opts.healthIntervalMs },
         timeouts: {

@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.8.0
+
+### Added
+
+- 人工目的地分流规则：`--prefer-direct` / `--prefer-proxy`（环境变量 `PREFER_DIRECT` / `PREFER_PROXY`），按目标 host 指定先直连或先走代理；逗号分隔，支持 `*` 通配。`dual-proxy` 与 `agent-gateway` 两个入口都透传，`--print-config` 输出规则。
+- 规则优先级：规则 > per-host 缓存 > 全局健康首选 > 默认顺序；两名单同时命中时直连优先；未命中规则的 host 行为不变。规则是人工策略，不是自动国内/海外分类。
+
+### Changed
+
+- 冷却从单一网关级改为两档：
+  - 代理自身 TCP/DNS/建连失败、407、代理沉默/响应头前 reset：全局冷却；
+  - direct 建连失败、经代理 CONNECT 到目标失败、TLS 失败、direct 等头超时、direct 响应头前 reset：按 `host + gateway` 冷却；
+  - 收到响应头后的流式中断不记冷却。
+- fast-fail 只对真正的缓存/健康首选生效；规则命中不制造“已知路径”，`preferDirect` 首条仍用完整 `attemptTimeoutMs`。
+- 健康检查仍是单 URL 全局信号，但规则命中的 host 不受它影响；它只作为未命中规则 host 的兜底。
+- `src/paths.js` 的建连结果增加 phase 分类，`noteFailure` 按 phase 选择冷却档位；CONNECT 路径区分代理建连失败与目标 CONNECT 失败。
+
+### Tests
+
+- 新增 `test/rules.test.js`（解析、匹配、优先级、健康/缓存覆盖、健康检查 host 规则、CLI/env、双入口 print-config）与 `test/cooldown.test.js`（两档冷却、host 隔离、proxy-reset/TLS/phase 分类、流式 reset、fast-fail 的 known 边界、健康检查清理范围）。
+- 测试用 `createDispatcher` 第二个参数注入 `tlsProbePort` / `onAttempt`，不进入公开 options/CLI；fast-fail 断言改为检查实际 timeout，不依赖 wall clock。
+- 总用例 152；`rules.js` 行/分支 100%；项目级行覆盖 94.62%。
+
 ## 0.7.4
 
 0.7.3 未发布的收尾版本：把 `EADDRINUSE` 诊断进一步区分为 LISTEN 冲突与 TIME-WAIT 冲突。

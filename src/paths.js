@@ -14,26 +14,34 @@ function tune(sock) {
   }
 }
 
+function timeoutError(message) {
+  const err = new Error(message);
+  err.code = 'ETIMEDOUT';
+  return err;
+}
+
 /**
- * 直连目标，成功回 socket，失败/超时回 null。
- * 只做 TCP 连接，不做 TLS——TLS 由 probeTls 或客户端自己完成。
+ * 直连目标，返回带 phase 的结果：成功 {sock, phase:null}，失败 {sock:null, phase}。
+ * phase 只用于冷却分类；连接失败统一记 direct-connect。
  */
-export function connectDirect(host, port, timeoutMs) {
+export function connectDirectDetailed(host, port, timeoutMs) {
   return new Promise((resolve) => {
     const sock = net.connect({ host, port });
     // 兜底监听：超时/销毁后底层若再冒 error，不能变成未捕获异常
     sock.on('error', () => {});
     let settled = false;
-    const done = (value) => {
+    const done = (value, error) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       sock.removeListener('error', onError);
       if (!value) sock.destroy();
-      resolve(value);
+      resolve(value
+        ? { sock: value, phase: null, error: null }
+        : { sock: null, phase: 'direct-connect', error: error || null });
     };
-    const timer = setTimeout(() => done(null), timeoutMs);
-    const onError = () => done(null);
+    const timer = setTimeout(() => done(null, timeoutError('direct connect timeout')), timeoutMs);
+    const onError = (err) => done(null, err);
     sock.once('connect', () => {
       tune(sock);
       done(sock);
@@ -42,46 +50,86 @@ export function connectDirect(host, port, timeoutMs) {
   });
 }
 
+/** 兼容旧调用：只回 socket/null。TLS 由 probeTls 或客户端自己完成。 */
+export async function connectDirect(host, port, timeoutMs) {
+  const result = await connectDirectDetailed(host, port, timeoutMs);
+  return result.sock;
+}
+
 /**
- * 经上游 HTTP 代理建 CONNECT 隧道，成功回 socket，失败/超时回 null。
- * 返回的 socket 处于隧道中，可直接写目标协议（TLS 由调用方/客户端完成）。
+ * 经上游 HTTP 代理建 CONNECT 隧道，返回带 phase 的结果。
+ *
+ * phase 区分：
+ *   proxy-connect  —— 到代理的 TCP/DNS/建连失败
+ *   proxy-auth     —— 代理返回 407
+ *   proxy-response —— 代理 accepted 但没有回响应头/响应头非法
+ *   proxy-reset    —— 代理在响应头前 reset
+ *   target-connect —— 代理回了非 200（目标 CONNECT 失败）
  */
-export function connectViaProxy(upstream, host, port, timeoutMs) {
+export function connectViaProxyDetailed(upstream, host, port, timeoutMs) {
   return new Promise((resolve) => {
     const sock = net.connect({ host: upstream.host, port: upstream.port });
     sock.on('error', () => {});
     let settled = false;
-    const done = (value) => {
+    let connected = false;
+    const done = (value, phase, error) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       sock.removeListener('data', onData);
       sock.removeListener('error', onError);
       if (!value) sock.destroy();
-      resolve(value);
+      resolve(value
+        ? { sock: value, phase: null, error: null }
+        : { sock: null, phase, error: error || null });
     };
-    const timer = setTimeout(() => done(null), timeoutMs);
+    const timer = setTimeout(
+      () => done(null, connected ? 'proxy-response' : 'proxy-connect', timeoutError('proxy connect timeout')),
+      timeoutMs
+    );
     let head = '';
     const onData = (chunk) => {
       head += chunk.toString('latin1');
       const end = head.indexOf('\r\n\r\n');
       if (end === -1) {
-        if (head.length > 16384) done(null);
+        if (head.length > 16384) done(null, 'proxy-response', new Error('proxy response too large'));
         return;
       }
       const statusLine = head.slice(0, head.indexOf('\r\n'));
-      if (!/^HTTP\/1\.[01] 200\b/.test(statusLine)) {
-        done(null);
+      const match = /^HTTP\/1\.[01] (\d{3})\b/.exec(statusLine);
+      if (!match) {
+        done(null, 'proxy-response', new Error('invalid proxy response'));
         return;
       }
-      // 200 之后同包到达的隧道数据（服务端先发言的 banner）留给调用方转交。
-      // 不能 unshift：socket 处于 flowing 模式，此刻没有 data 监听，数据会被丢掉。
-      const leftover = head.slice(end + 4);
-      if (leftover) sock[LEFTOVER] = Buffer.from(leftover, 'latin1');
-      tune(sock);
-      done(sock);
+      const status = Number(match[1]);
+      if (status === 200) {
+        // 200 之后同包到达的隧道数据（服务端先发言的 banner）留给调用方转交。
+        // 不能 unshift：socket 处于 flowing 模式，此刻没有 data 监听，数据会被丢掉。
+        const leftover = head.slice(end + 4);
+        if (leftover) sock[LEFTOVER] = Buffer.from(leftover, 'latin1');
+        tune(sock);
+        done(sock);
+        return;
+      }
+      if (status === 407) {
+        done(null, 'proxy-auth', Object.assign(new Error('proxy authentication required'), {
+          code: 'EPROXYAUTH',
+          status
+        }));
+        return;
+      }
+      done(null, 'target-connect', Object.assign(new Error('proxy CONNECT failed: ' + status), {
+        code: 'ECONNECTFAILED',
+        status
+      }));
     };
-    const onError = () => done(null);
+    const onError = (err) => {
+      const phase = connected
+        ? (err && err.code === 'ECONNRESET' ? 'proxy-reset' : 'proxy-response')
+        : 'proxy-connect';
+      done(null, phase, err);
+    };
+    sock.on('connect', () => { connected = true; });
     sock.on('data', onData);
     sock.on('error', onError);
     sock.write(
@@ -91,6 +139,12 @@ export function connectViaProxy(upstream, host, port, timeoutMs) {
       'Proxy-Connection: keep-alive\r\n\r\n'
     );
   });
+}
+
+/** 兼容旧调用：只回 socket/null。 */
+export async function connectViaProxy(upstream, host, port, timeoutMs) {
+  const result = await connectViaProxyDetailed(upstream, host, port, timeoutMs);
+  return result.sock;
 }
 
 /**
@@ -110,6 +164,24 @@ export async function probeTls(open, host, port, timeoutMs) {
   }
   sock.destroy();
   return false;
+}
+
+/**
+ * 带 phase 的 TLS 探测：打开失败沿用 open 的 phase；打开成功但握手失败记 tls。
+ * 只给选路/冷却用，不改变 probeTls 的旧接口。
+ */
+export async function probeTlsDetailed(open, host, port, timeoutMs) {
+  const opened = await open(host, port, timeoutMs);
+  if (!opened || !opened.sock) {
+    return { ok: false, phase: (opened && opened.phase) || 'direct-connect' };
+  }
+  const client = await tlsOver(opened.sock, host, timeoutMs);
+  if (client) {
+    client.destroy();
+    return { ok: true, phase: null };
+  }
+  opened.sock.destroy();
+  return { ok: false, phase: 'tls' };
 }
 
 /** 在一条路上完成 TLS 握手，返回已加密的 socket；失败回 null。 */

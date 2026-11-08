@@ -6,6 +6,7 @@ import { realpathSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { createDispatcher, IDENTITY_HEADER, IDENTITY_PATH } from '../src/server.js';
 import { collectGateways, isLoopbackHost, resolveUpstream } from '../src/gateways.js';
+import { splitPatterns } from '../src/rules.js';
 import { assertNode } from '../src/engines.js';
 import { AGENT_NAMES, resolveAgent, buildProxyEnv, proxyUrl } from '../src/agents.js';
 
@@ -14,7 +15,8 @@ const pkg = require('../package.json');
 
 const LAUNCHER_OPTS = [
   '--listen-host', '--listen-port', '--port-fallback', '--upstream-host', '--upstream-port', '--upstream-url',
-  '--gateway', '--health-url', '--health-interval-ms', '--timeout-ms', '--response-timeout-ms',
+  '--gateway', '--prefer-direct', '--prefer-proxy',
+  '--health-url', '--health-interval-ms', '--timeout-ms', '--response-timeout-ms',
   '--fast-fail-ms', '--cooldown-ms', '--pref-ttl-ms'
 ];
 const FLAGS = [
@@ -30,6 +32,7 @@ function usage() {
     '  agent-gateway run [options] <agent> [agent-args...]',
     '  agent-gateway run [options] -- <cmd> [args...]',
     '  agent-gateway env [options]        # 打印可 source 的导出语句',
+    '  agent-gateway --print-config [options]  # 打印生效配置后退出',
     '',
     'Agents: ' + AGENT_NAMES.join(', '),
     '',
@@ -41,6 +44,8 @@ function usage() {
     '  --upstream-port <port>      default 7897',
     '  --upstream-url <url>        full upstream URL, may include user:pass',
     '  --gateway <host:port>       extra candidate gateway, repeatable',
+    '  --prefer-direct <patterns>  try direct first for these hosts (comma-separated, * glob)',
+    '  --prefer-proxy <patterns>   try proxies first for these hosts (comma-separated, * glob)',
     '  --health-url <url>          verify the channel with this URL, default off',
     '  --health-interval-ms <ms>   default 60000, 0 disables',
     '  --timeout-ms <ms>           per-attempt timeout, default 5000',
@@ -61,6 +66,17 @@ function usage() {
 
 /** 参数错误：由顶层以退出码 2 结束。 */
 export class UsageError extends Error {}
+
+/** URL 展示用：去掉 userinfo、查询串与 hash。 */
+function redactUrl(value) {
+  if (!value) return null;
+  try {
+    const url = new URL(value);
+    return url.protocol + '//' + url.host + url.pathname;
+  } catch (err) {
+    return '<invalid>';
+  }
+}
 
 /** 解析整数并校验范围；失败抛 UsageError。 */
 function integer(label, raw, min, max) {
@@ -83,6 +99,8 @@ function parseArgs(argv, env = process.env) {
     responseTimeoutMs: integer('RESPONSE_TIMEOUT_MS', env.RESPONSE_TIMEOUT_MS ?? 60000, 100, 600000),
     prefTtlMs: integer('PREF_TTL_MS', env.PREF_TTL_MS ?? 60000, 0, 3600000),
     gateways: env.GATEWAY ? [env.GATEWAY] : [],
+    preferDirect: splitPatterns(env.PREFER_DIRECT),
+    preferProxy: splitPatterns(env.PREFER_PROXY),
     healthUrl: env.HEALTH_URL || '',
     healthIntervalMs: integer('HEALTH_INTERVAL_MS', env.HEALTH_INTERVAL_MS ?? 60000, 0, 3600000),
     fastFailTimeoutMs: integer('FAST_FAIL_MS', env.FAST_FAIL_MS ?? 2000, 100, 60000),
@@ -137,6 +155,8 @@ function parseArgs(argv, env = process.env) {
     else if (arg === '--upstream-port') opts.upstreamPort = integer(arg, value, 1, 65535);
     else if (arg === '--upstream-url') opts.upstreamUrl = value;
     else if (arg === '--gateway') opts.gateways.push(value);
+    else if (arg === '--prefer-direct') opts.preferDirect.push(...splitPatterns(value));
+    else if (arg === '--prefer-proxy') opts.preferProxy.push(...splitPatterns(value));
     else if (arg === '--health-url') opts.healthUrl = value;
     else if (arg === '--health-interval-ms') opts.healthIntervalMs = integer(arg, value, 0, 3600000);
     else if (arg === '--timeout-ms') opts.attemptTimeoutMs = integer(arg, value, 100, 60000);
@@ -305,6 +325,41 @@ async function printEnv(argv) {
   process.stdout.write(keys.map((key) => 'export ' + key + '=' + env[key]).join('\n') + '\n');
 }
 
+/** 打印生效配置（凭证只显示是否存在），不启动监听、不启动 agent。 */
+function printConfig(argv) {
+  const { opts } = parseArgs(argv);
+  const upstream = resolveUpstream(opts);
+  const gateways = collectGateways({
+    upstream,
+    extra: opts.gateways,
+    env: process.env,
+    self: { host: opts.listenHost, port: opts.listenPort },
+    onInvalid: (subject, reason) => process.stderr.write('warning: ' + subject + ': ' + reason + '\n')
+  });
+  const view = {
+    listen: { host: opts.listenHost, port: opts.listenPort, portFallback: opts.portFallback },
+    upstream: { host: upstream.host, port: upstream.port, auth: Boolean(upstream.auth) },
+    gateways: gateways.map((g) => ({ host: g.host, port: g.port, auth: Boolean(g.auth) })),
+    preferDirect: opts.preferDirect,
+    preferProxy: opts.preferProxy,
+    direct: true,
+    health: { url: redactUrl(opts.healthUrl), intervalMs: opts.healthIntervalMs },
+    timeouts: {
+      attemptMs: opts.attemptTimeoutMs,
+      responseMs: opts.responseTimeoutMs,
+      fastFailMs: opts.fastFailTimeoutMs
+    },
+    cooldownMs: opts.cooldownMs,
+    prefTtlMs: opts.prefTtlMs,
+    replay: {
+      nonIdempotentAfterSend: opts.retryNonIdempotentAfterSend,
+      idempotencyKey: opts.retryNonIdempotentWithIdempotencyKey
+    },
+    verifyTls: opts.verifyTls
+  };
+  process.stdout.write(JSON.stringify(view, null, 2) + '\n');
+}
+
 async function main() {
   try {
     assertNode();
@@ -317,6 +372,8 @@ async function main() {
       await run(rest);
     } else if (command === 'env') {
       await printEnv(rest);
+    } else if (command === '--print-config' || command === 'print-config') {
+      printConfig(rest);
     } else {
       process.stderr.write('[agent-gateway] unknown command: ' + command + '\n');
       usage();

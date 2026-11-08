@@ -1,11 +1,25 @@
 import http from 'node:http';
 import net from 'node:net';
-import { connectDirect, connectViaProxy, probeTls, probeHttp, LEFTOVER } from './paths.js';
+import {
+  connectDirect,
+  connectDirectDetailed,
+  connectViaProxy,
+  connectViaProxyDetailed,
+  probeTlsDetailed,
+  probeHttp,
+  LEFTOVER
+} from './paths.js';
 import { createPref } from './pref.js';
 import { buildCandidates } from './gateways.js';
+import { createRouteDecision } from './rules.js';
 import { hasIdempotencyKey, isIdempotent, shouldRetryAfterSend } from './retry-policy.js';
 
 const DEFAULT_LOG = (msg) => process.stderr.write('[dual-proxy] ' + msg + '\n');
+
+/** fast-fail 只应落在真正的已知路径上；规则命中、但第一条不是缓存/健康首选时不启用。 */
+export function isKnownFirst(knownId, list) {
+  return Boolean(knownId && list && list[0] && list[0].id === knownId);
+}
 
 /** 本地身份端点：端口复用前用来确认监听者确实是本代理。 */
 export const IDENTITY_PATH = '/__agent_dual_proxy__';
@@ -150,8 +164,9 @@ function parseHealthUrl(value) {
  * @param {number} [options.prefTtlMs=60000]
  * @param {boolean} [options.verifyTls=true]
  * @param {function} [options.log]
+ * @param {object} [internals] 仅测试注入：`tlsProbePort`、`onAttempt`；不进入公开 options/CLI
  */
-export function createDispatcher(options) {
+export function createDispatcher(options, internals = {}) {
   const opts = mergeOptions({
     listenHost: '127.0.0.1',
     listenPort: 7898,
@@ -172,10 +187,16 @@ export function createDispatcher(options) {
     prefMaxSize: 1000,
     shutdownTimeoutMs: 1500,
     verifyTls: true,
+    preferDirect: [],
+    preferProxy: [],
     log: DEFAULT_LOG
   }, options);
 
   const log = opts.log;
+  // 测试专用注入，不进入 options/CLI/README；生产默认 443、无 onAttempt。
+  const testHooks = internals || {};
+  const tlsProbePort = testHooks.tlsProbePort || 443;
+  const onAttempt = typeof testHooks.onAttempt === 'function' ? testHooks.onAttempt : null;
   const pref = createPref(opts.prefTtlMs, undefined, opts.prefMaxSize);
   const upstreamCandidate = Object.assign(
     { host: opts.upstreamHost, port: opts.upstreamPort },
@@ -190,6 +211,7 @@ export function createDispatcher(options) {
   const publicView = (list) => list.map((gateway) => (gateway.direct
     ? { id: gateway.id, direct: true }
     : { id: gateway.id, host: gateway.host, port: gateway.port }));
+  const routeDecision = createRouteDecision(opts);
   const candidates = buildFor({ host: opts.listenHost, port: opts.listenPort });
   const publicCandidates = publicView(candidates);
 
@@ -207,35 +229,72 @@ export function createDispatcher(options) {
   let preferred = null;
   let healthTimer = null;
   let lastKickAt = 0;
-  /** 网关冷却：失败过的候选在一段时间内排到最后，避免每个新 host 都先撞它一次。 */
-  const cooldowns = new Map();
+  /**
+   * 两档冷却：
+   *   - 网关级：代理自身连不上、407、代理沉默/响应头前 reset —— 对所有 host 都坏；
+   *   - host 级：direct 建连失败、目标 CONNECT 失败、TLS 失败、direct 等头/reset —— 只影响该 host。
+   * 流式响应开始后的 reset 不属于选路失败，不记冷却。
+   */
+  const gatewayCooldowns = new Map();
+  const hostCooldowns = new Map();
+  const GLOBAL_PHASES = new Set(['proxy-connect', 'proxy-auth', 'proxy-response', 'proxy-reset']);
+  const hostKey = (host, id) => host + '\u0000' + id;
 
-  function isCooling(id) {
-    const until = cooldowns.get(id);
-    if (until === undefined) return false;
+  function coolingUntil(map, key) {
+    const until = map.get(key);
+    if (until === undefined) return null;
     if (Date.now() >= until) {
-      cooldowns.delete(id);
-      return false;
+      map.delete(key);
+      return null;
     }
-    return true;
+    return until;
   }
 
-  function cool(id) {
-    if (opts.cooldownMs > 0) cooldowns.set(id, Date.now() + opts.cooldownMs);
+  function isGatewayCooling(id) {
+    return coolingUntil(gatewayCooldowns, id) !== null;
   }
 
-  function warm(id) {
-    cooldowns.delete(id);
+  function isHostCooling(host, id) {
+    return coolingUntil(hostCooldowns, hostKey(host, id)) !== null;
+  }
+
+  /** host 省略时只查全局冷却；传入 host 时查全局或该 host+gateway 的 host 冷却。 */
+  function isCooling(id, host) {
+    return isGatewayCooling(id) || (host !== undefined && isHostCooling(host, id));
+  }
+
+  function coolGateway(id) {
+    if (opts.cooldownMs > 0) gatewayCooldowns.set(id, Date.now() + opts.cooldownMs);
+  }
+
+  function coolHost(host, id) {
+    if (opts.cooldownMs <= 0) return;
+    const key = hostKey(host, id);
+    if (!hostCooldowns.has(key) && opts.prefMaxSize > 0 && hostCooldowns.size >= opts.prefMaxSize) {
+      const oldest = hostCooldowns.keys().next().value;
+      if (oldest !== undefined) hostCooldowns.delete(oldest);
+    }
+    hostCooldowns.set(key, Date.now() + opts.cooldownMs);
+  }
+
+  function warmGateway(id) {
+    gatewayCooldowns.delete(id);
+  }
+
+  function warmHost(host, id) {
+    hostCooldowns.delete(hostKey(host, id));
   }
 
   /** 一条路成功/失败时的统一记账：偏好、冷却、健康复检。 */
   function noteSuccess(host, gateway) {
     pref.set(host, gateway.id);
-    warm(gateway.id);
+    warmGateway(gateway.id);
+    warmHost(host, gateway.id);
   }
 
-  function noteFailure(gateway) {
-    cool(gateway.id);
+  function noteFailure(gateway, { host, phase } = {}) {
+    if (GLOBAL_PHASES.has(phase) || host === undefined) coolGateway(gateway.id);
+    else coolHost(host, gateway.id);
     kickHealth();
   }
 
@@ -243,11 +302,15 @@ export function createDispatcher(options) {
     ? connectDirect(host, port, timeoutMs)
     : connectViaProxy(gateway, host, port, timeoutMs));
 
-  /** 候选顺序：健康选中的网关 → 该 host 上次走通的网关 → 其余；冷却中的一律排最后。 */
+  const openViaDetailed = (gateway, host, port, timeoutMs = opts.attemptTimeoutMs) => (gateway.direct
+    ? connectDirectDetailed(host, port, timeoutMs)
+    : connectViaProxyDetailed(gateway, host, port, timeoutMs));
+
+  /** 候选顺序：健康首选 → 该 host 上次走通的网关 → 其余 → 目的地规则最后覆盖。 */
   function order(host) {
     const hot = [];
     const cold = [];
-    for (const gateway of candidates) (isCooling(gateway.id) ? cold : hot).push(gateway);
+    for (const gateway of candidates) (isCooling(gateway.id, host) ? cold : hot).push(gateway);
     const move = (list, id) => {
       const index = list.findIndex((gateway) => gateway.id === id);
       if (index > 0) list.unshift(list.splice(index, 1)[0]);
@@ -255,39 +318,54 @@ export function createDispatcher(options) {
     if (preferred) move(hot, preferred);
     const cached = pref.get(host);
     if (cached) move(hot, cached);
+    const decision = routeDecision(host);
+    if (decision === 'direct') {
+      move(hot, 'direct');
+    } else if (decision === 'proxy') {
+      const index = hot.findIndex((gateway) => gateway.direct);
+      if (index >= 0 && index < hot.length - 1) hot.push(hot.splice(index, 1)[0]);
+    }
     return hot.concat(cold);
+  }
+
+  /** 只有真正的缓存/健康首选才算法已知路径；规则只改顺序，不制造已知路径。 */
+  function knownPath(host, list) {
+    const knownId = pref.get(host) || preferred;
+    return isKnownFirst(knownId, list) ? knownId : null;
   }
 
   /**
    * 依次试候选网关，返回第一个能承载 TLS（443 时）且连通的隧道。
-   * 已有已知路径（缓存或健康首选）时，第一条只给 fastFailTimeoutMs —— 它挂了要快点换。
+   * 已有真正的已知路径（缓存或健康首选）时，第一条只给 fastFailTimeoutMs —— 它挂了要快点换。
    */
   async function openTunnel(host, port) {
-    const known = pref.get(host) || preferred;
     const list = order(host);
+    const known = knownPath(host, list);
     for (let i = 0; i < list.length; i += 1) {
       const gateway = list[i];
       const timeout = i === 0 && known && opts.fastFailTimeoutMs < opts.attemptTimeoutMs
         ? opts.fastFailTimeoutMs
         : opts.attemptTimeoutMs;
-      if (port === 443 && opts.verifyTls) {
-        const ok = await probeTls(
-          (h, p) => openVia(gateway, h, p, timeout), host, port, timeout
+      if (onAttempt) onAttempt({ kind: 'connect', host, port, index: i, gateway: gateway.id, timeout, known: Boolean(known) });
+      // tlsProbePort 仅供测试在临时端口触发 TLS 探测；生产默认 443。
+      if (port === tlsProbePort && opts.verifyTls) {
+        const probe = await probeTlsDetailed(
+          (h, p) => openViaDetailed(gateway, h, p, timeout), host, port, timeout
         );
-        if (!ok) {
-          log(host + ':' + port + ' ' + gateway.id + ' TLS probe failed');
-          noteFailure(gateway);
+        if (!probe.ok) {
+          log(host + ':' + port + ' ' + gateway.id + ' TLS probe failed (' + probe.phase + ')');
+          noteFailure(gateway, { host, phase: probe.phase });
           continue;
         }
       }
-      const sock = await openVia(gateway, host, port, timeout);
-      if (sock) {
+      const opened = await openViaDetailed(gateway, host, port, timeout);
+      if (opened.sock) {
         noteSuccess(host, gateway);
         log(host + ':' + port + ' -> ' + gateway.id);
-        return sock;
+        return opened.sock;
       }
-      log(host + ':' + port + ' ' + gateway.id + ' failed');
-      noteFailure(gateway);
+      log(host + ':' + port + ' ' + gateway.id + ' failed (' + opened.phase + ')');
+      noteFailure(gateway, { host, phase: opened.phase });
     }
     log(host + ':' + port + ' all gateways failed');
     return null;
@@ -365,8 +443,11 @@ export function createDispatcher(options) {
         const fail = (message) => {
           const err = new Error(message);
           err.code = 'ETIMEDOUT';
+          const phase = gateway.direct
+            ? (sent ? 'header' : 'direct-connect')
+            : (sent ? 'proxy-response' : 'proxy-connect');
           clearTimers();
-          resolve({ err, sent });
+          resolve({ err, sent, phase });
           upstreamReq.destroy(err);
         };
 
@@ -375,7 +456,11 @@ export function createDispatcher(options) {
           if (!gateway.direct && up.statusCode === 407) {
             up.resume();
             up.destroy();
-            resolve({ err: Object.assign(new Error('proxy authentication required'), { code: 'EPROXYAUTH' }), sent: true });
+            resolve({
+              err: Object.assign(new Error('proxy authentication required'), { code: 'EPROXYAUTH' }),
+              sent: true,
+              phase: 'proxy-auth'
+            });
             return;
           }
           resolve({ up });
@@ -391,14 +476,19 @@ export function createDispatcher(options) {
           else markSent();
         });
         upstreamReq.on('error', (err) => {
+          const phase = gateway.direct
+            ? (sent ? 'direct-reset' : 'direct-connect')
+            : (sent
+              ? (err && err.code === 'ECONNRESET' ? 'proxy-reset' : 'proxy-response')
+              : 'proxy-connect');
           clearTimers();
-          resolve({ err, sent });
+          resolve({ err, sent, phase });
         });
         upstreamReq.end(body);
       });
 
-      const known = pref.get(host) || preferred;
       const list = order(host);
+      const known = knownPath(host, list);
       (async () => {
         try {
           for (let i = 0; i < list.length; i += 1) {
@@ -406,10 +496,12 @@ export function createDispatcher(options) {
             const timeout = i === 0 && known && opts.fastFailTimeoutMs < opts.attemptTimeoutMs
               ? opts.fastFailTimeoutMs
               : opts.attemptTimeoutMs;
+            if (onAttempt) onAttempt({ kind: 'http', host, port, index: i, gateway: gateway.id, timeout, known: Boolean(known) });
             const r = await attemptVia(gateway, timeout);
             if (r.err) {
-              log(host + ' ' + gateway.id + ' failed: ' + (r.err.code || r.err.message));
-              noteFailure(gateway);
+              log(host + ' ' + gateway.id + ' failed: ' + (r.err.code || r.err.message) +
+                ' (' + r.phase + ')');
+              noteFailure(gateway, { host, phase: r.phase });
               // 407 是代理在转发前拒绝，目标没收到请求：无论方法是否幂等都应换下一条。
               if (r.err.code === 'EPROXYAUTH') continue;
               if (!shouldRetryAfterSend({
@@ -532,7 +624,8 @@ export function createDispatcher(options) {
         }
         preferred = result.id;
         pref.set(health.host, result.id);
-        warm(result.id);
+        warmGateway(result.id);
+        warmHost(health.host, result.id);
       } else {
         if (preferred !== null) log('health: no gateway reached ' + health.host + ':' + health.port);
         preferred = null;
