@@ -156,6 +156,7 @@ The suite covers: HTTP direct fallback, forwarding through a fake proxy, skippin
 - The health check sends one unauthenticated `GET`; the criterion is "a response below 500", not whether credentials or model permissions are valid. It is only a fallback signal for hosts that match no policy rule, not a classification input.
 - **Local-proxy discovery is Linux-only**; non-Linux behaviour matches 0.8.0. Per-target discovery only runs for 80/443 and non-loopback/private targets; custom ports and private model endpoints need an explicit `--gateway`.
 - Discovery skips sibling instances by default; if the only working path is a sibling, discovery will not use it automatically. Discovery is not a guarantee: with no local proxy and no direct path, the proxy still returns 502.
+- **A direct HTTP 5xx is a target response, not a failed candidate, and does not trigger discovery**; discovery runs only on connect/DNS/TLS/header failures. The 5xx is passed through unchanged.
 - **At-most-once is not guaranteed**: with the default `retryNonIdempotentAfterSend: false`, `POST`/`PATCH` return 502 immediately after a failure once the connection is established (possibly delivered, not replayed), while idempotent methods are still replayed; enabling the switch restores replay-after-send at the cost of possible duplicate execution. Client SDK retries on 5xx are outside the proxy's control; for billing- or write-sensitive calls, use idempotency keys upstream.
 
 ## Feedback

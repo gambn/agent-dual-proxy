@@ -168,7 +168,7 @@ function parseHealthUrl(value) {
  * @param {number} [options.prefTtlMs=60000]
  * @param {boolean} [options.verifyTls=true]
  * @param {function} [options.log]
- * @param {object} [internals] 仅测试注入：`tlsProbePort`、`onAttempt`、`discoveryFind`、`startupDiscovery`；不进入公开 options/CLI
+ * @param {object} [internals] 仅测试注入：`tlsProbePort`、`onAttempt`、`discoveryFind`、`startupDiscovery`、`allowPrivateDiscovery`、`allowDiscoveryPort`；不进入公开 options/CLI
  */
 export function createDispatcher(options, internals = {}) {
   const opts = mergeOptions({
@@ -243,6 +243,7 @@ export function createDispatcher(options, internals = {}) {
   const discovered = new Map();
   let discoveryRunning = false;
   let discoveryPromise = null;
+  let discoveryTarget = null;
   let lastFailureDiscoveryAt = 0;
 
   function pruneDiscovered() {
@@ -297,13 +298,28 @@ export function createDispatcher(options, internals = {}) {
 
   async function discoverFor(targetHost, targetPort, secure, reason) {
     if (!opts.discoverLocalProxy) return 0;
-    if (discoveryRunning) return 0;
+    const key = targetHost + '\u0000' + targetPort + '\u0000' + String(secure);
+    let inherited = 0;
+    // 启动扫描最长约 6.4 秒。目标失败时如果正好在扫，先等它结束；
+    // 如果它扫的不是本次目标，再为本次目标补扫一次，不能直接返回 0。
+    while (discoveryRunning) {
+      if (reason === 'startup') return 0;
+      const runningKey = discoveryTarget;
+      const pending = discoveryPromise;
+      try {
+        inherited += await pending;
+      } catch (e) {
+        /* 上一轮内部已记日志 */
+      }
+      if (runningKey === key) return inherited;
+    }
     if (reason !== 'startup') {
       const now = Date.now();
-      if (now - lastFailureDiscoveryAt < opts.discoveryThrottleMs) return 0;
+      if (now - lastFailureDiscoveryAt < opts.discoveryThrottleMs) return inherited;
       lastFailureDiscoveryAt = now;
     }
     discoveryRunning = true;
+    discoveryTarget = key;
     discoveryPromise = (async () => {
       try {
         const result = await discoveryFind({
@@ -323,15 +339,17 @@ export function createDispatcher(options, internals = {}) {
         return 0;
       } finally {
         discoveryRunning = false;
+        discoveryTarget = null;
         discoveryPromise = null;
       }
     })();
-    return discoveryPromise;
+    return (await discoveryPromise) + inherited;
   }
 
   function canDiscoverForTarget(host, port) {
     if (!opts.discoverLocalProxy) return false;
-    if (port !== 80 && port !== 443) return false;
+    if (port !== 80 && port !== 443 && testHooks.allowDiscoveryPort !== true) return false;
+    if (testHooks.allowPrivateDiscovery === true) return true;
     return !isPrivateTarget(host);
   }
   const health = parseHealthUrl(opts.healthUrl);

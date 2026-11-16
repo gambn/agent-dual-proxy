@@ -14,11 +14,12 @@
 
 - 启动发现只注入候选，不抢占已有 `preferred`，不强制复检；已有 preferred 是否失效交给正常健康检查。
 - 发现与重试不绕过两档冷却、`preferDirect`/`preferProxy` 和偏好缓存；非幂等请求复用 `shouldRetryAfterSend`。
+- 目标失败遇到正在运行的启动发现时先等待；如果启动扫描的目标不同，再按本次目标补扫一次，当前请求可重试。直连 5xx 是目标响应，不触发发现。
 
 ### Tests
 
 - 新增 `test/discovery.test.js`：`/proc` 解析、HTTP/HTTPS 探测判定、身份端点、三种触发、非幂等边界、CONNECT 重试、TTL、CLI/env；`discovery.js` 行/分支/函数 100%。
-- 总用例 169；项目级行覆盖 95.39%。
+- 总用例 172；项目级行覆盖 95.51%。
 
 ## 0.8.0
 

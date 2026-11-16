@@ -339,11 +339,13 @@ test('discovery：按目标失败触发发现并重试一次', async () => {
       upstreamPort: dead,
       attemptTimeoutMs: 500
     }, async (d, addr) => {
-      const r = await httpVia(addr.port, 'http://dead.invalid/');
+      const r = await httpVia(addr.port, 'http://127.0.0.1:' + dead + '/');
       assert.equal(r.status, 200);
       assert.equal(finds, 1, '目标失败应触发一次发现');
     }, {
       startupDiscovery: false,
+      allowPrivateDiscovery: true,
+      allowDiscoveryPort: true,
       discoveryFind: async () => {
         finds += 1;
         return { scanned: 1, results: [{ host: '127.0.0.1', port: proxy.port, source: 'discovered' }] };
@@ -370,11 +372,13 @@ test('discovery：健康直连成功、海外目标失败仍触发发现', async
     }, async (d, addr) => {
       await d.runHealth();
       assert.equal(d.getPreferred(), 'direct', '健康直连应先成功');
-      const r = await httpVia(addr.port, 'http://dead.invalid/');
+      const r = await httpVia(addr.port, 'http://127.0.0.1:' + dead + '/');
       assert.equal(r.status, 200);
       assert.equal(finds, 1, '健康未全失败时，海外目标失败仍应触发发现');
     }, {
       startupDiscovery: false,
+      allowPrivateDiscovery: true,
+      allowDiscoveryPort: true,
       discoveryFind: async () => {
         finds += 1;
         return { scanned: 1, results: [{ host: '127.0.0.1', port: proxy.port, source: 'discovered' }] };
@@ -389,6 +393,7 @@ test('discovery：健康直连成功、海外目标失败仍触发发现', async
 test('discovery：非幂等已发送失败不因发现重试', async () => {
   const stalled = await startSilent();
   const proxy = await startStatusTunnelProxy(200);
+  const dead = await closedPort();
   let finds = 0;
   try {
     await withDispatcher({
@@ -397,12 +402,14 @@ test('discovery：非幂等已发送失败不因发现重试', async () => {
       attemptTimeoutMs: 500,
       responseTimeoutMs: 200
     }, async (d, addr) => {
-      const r = await requestVia(addr.port, 'http://dead.invalid/', { method: 'POST', body: 'p' });
+      const r = await requestVia(addr.port, 'http://127.0.0.1:' + dead + '/', { method: 'POST', body: 'p' });
       assert.equal(r.status, 502);
       assert.equal(r.body, 'non-idempotent request may have been delivered; not replayed');
       assert.equal(finds, 0, '已发送的非幂等失败不应触发发现重试');
     }, {
       startupDiscovery: false,
+      allowPrivateDiscovery: true,
+      allowDiscoveryPort: true,
       discoveryFind: async () => {
         finds += 1;
         return { scanned: 1, results: [{ host: '127.0.0.1', port: proxy.port, source: 'discovered' }] };
@@ -425,11 +432,13 @@ test('discovery：CONNECT 在建立前失败可按目标发现并重试', async 
       attemptTimeoutMs: 500,
       verifyTls: false
     }, async (d, addr) => {
-      const sock = await tunnelVia(addr.port, 'dead.invalid', 443);
+      const sock = await tunnelVia(addr.port, '127.0.0.1', dead);
       sock.destroy();
       assert.equal(finds, 1);
     }, {
       startupDiscovery: false,
+      allowPrivateDiscovery: true,
+      allowDiscoveryPort: true,
       discoveryFind: async () => {
         finds += 1;
         return { scanned: 1, results: [{ host: '127.0.0.1', port: proxy.port, source: 'discovered' }] };
@@ -449,7 +458,7 @@ test('discovery：健康全失败触发发现并复检为首选', async () => {
       discoverLocalProxy: true,
       upstreamPort: dead,
       attemptTimeoutMs: 500,
-      healthUrl: 'http://dead.invalid/health',
+      healthUrl: 'http://127.0.0.1:' + dead + '/health',
       healthIntervalMs: 0,
       healthTimeoutMs: 800
     }, async (d) => {
@@ -482,7 +491,7 @@ test('discovery：TTL 到期移除发现项，不按失败次数删除', async (
       attemptTimeoutMs: 500,
       discoveryTtlMs: 50
     }, async (d, addr) => {
-      const first = await httpVia(addr.port, 'http://dead.invalid/');
+      const first = await httpVia(addr.port, 'http://127.0.0.1:' + dead + '/');
       assert.equal(first.status, 200);
       assert.ok(d.candidates.some((c) => c.port === proxy.port));
       await new Promise((resolve) => setTimeout(resolve, 90));
@@ -491,6 +500,8 @@ test('discovery：TTL 到期移除发现项，不按失败次数删除', async (
       assert.equal(d.candidates.some((c) => c.port === proxy.port), false, 'TTL 到期应移除');
     }, {
       startupDiscovery: false,
+      allowPrivateDiscovery: true,
+      allowDiscoveryPort: true,
       discoveryFind: async () => ({ scanned: 1, results: [{ host: '127.0.0.1', port: proxy.port, source: 'discovered' }] })
     });
   } finally {
@@ -523,7 +534,7 @@ test('discovery：库层默认关闭，CLI 默认开启，关闭开关生效', a
     upstreamPort: dead,
     attemptTimeoutMs: 500
   }, async (d, addr) => {
-    const r = await httpVia(addr.port, 'http://dead.invalid/');
+    const r = await httpVia(addr.port, 'http://127.0.0.1:' + dead + '/');
     assert.equal(r.status, 502);
     assert.equal(finds, 0);
   }, {
@@ -533,4 +544,89 @@ test('discovery：库层默认关闭，CLI 默认开启，关闭开关生效', a
       return { scanned: 1, results: [] };
     }
   });
+});
+
+test('discovery：默认目标门禁拒绝私网/非 80·443，测试钩子才放行', async () => {
+  const dead = await closedPort();
+  let finds = 0;
+  await withDispatcher({
+    discoverLocalProxy: true,
+    upstreamPort: dead,
+    attemptTimeoutMs: 500
+  }, async (d, addr) => {
+    const r = await httpVia(addr.port, 'http://127.0.0.1:' + dead + '/');
+    assert.equal(r.status, 502);
+    assert.equal(finds, 0, '默认不应发现 loopback / 非 80·443 目标');
+  }, {
+    startupDiscovery: false,
+    discoveryFind: async () => {
+      finds += 1;
+      return { scanned: 1, results: [] };
+    }
+  });
+});
+
+test('discovery：直连 5xx 视为目标响应，不触发发现', async () => {
+  const target = await startStatusTunnelProxy(502);
+  const dead = await closedPort();
+  let finds = 0;
+  try {
+    await withDispatcher({
+      discoverLocalProxy: true,
+      upstreamPort: dead,
+      attemptTimeoutMs: 500
+    }, async (d, addr) => {
+      const r = await httpVia(addr.port, 'http://127.0.0.1:' + target.port + '/');
+      assert.equal(r.status, 502);
+      assert.equal(finds, 0, '5xx 是目标响应，不是候选失败');
+    }, {
+      startupDiscovery: false,
+      allowPrivateDiscovery: true,
+      allowDiscoveryPort: true,
+      discoveryFind: async () => {
+        finds += 1;
+        return { scanned: 1, results: [] };
+      }
+    });
+  } finally {
+    await target.close();
+  }
+});
+
+test('discovery：慢启动发现进行中，目标失败等待并补扫', async () => {
+  const health = await startTarget();
+  const proxy = await startStatusTunnelProxy(200);
+  const target = await closedPort();
+  let startedResolve;
+  const started = new Promise((resolve) => { startedResolve = resolve; });
+  let finds = 0;
+  try {
+    await withDispatcher({
+      discoverLocalProxy: true,
+      upstreamPort: target,
+      attemptTimeoutMs: 500,
+      healthUrl: 'http://127.0.0.1:' + health.port + '/health',
+      healthIntervalMs: 0
+    }, async (d, addr) => {
+      await started;
+      const r = await httpVia(addr.port, 'http://127.0.0.1:' + target + '/');
+      assert.equal(r.status, 200, '目标失败应等待启动发现并补扫后重试');
+      assert.equal(finds, 2, '启动扫描 + 按目标补扫');
+    }, {
+      allowPrivateDiscovery: true,
+      allowDiscoveryPort: true,
+      discoveryFind: async ({ targetHost, targetPort }) => {
+        finds += 1;
+        if (targetHost === '127.0.0.1' && targetPort === health.port) {
+          startedResolve();
+          await new Promise((resolve) => setTimeout(resolve, 150));
+          return { scanned: 1, results: [{ host: '127.0.0.1', port: proxy.port, source: 'discovered' }] };
+        }
+        return { scanned: 1, results: [{ host: '127.0.0.1', port: proxy.port, source: 'discovered' }] };
+      }
+    });
+  } finally {
+    await health.close();
+    await proxy.close();
+  }
 });
