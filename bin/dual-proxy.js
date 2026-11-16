@@ -38,6 +38,7 @@ function usage() {
     '  --response-timeout-ms <ms>  header wait for plain HTTP, default 60000',
     '  --pref-ttl-ms <ms>      per-host preference TTL, default 60000',
     '  --no-verify-tls         skip the TLS reachability probe on 443',
+    '  --no-discover-local-proxy  disable local proxy discovery fallback',
     '  --retry-non-idempotent-after-send  replay POST/PATCH after the body may have',
     '                          been sent (dangerous; default off)',
     '  --retry-non-idempotent-with-idempotency-key',
@@ -49,8 +50,8 @@ function usage() {
     '               UPSTREAM_URL / GATEWAY / PREFER_DIRECT / PREFER_PROXY /',
     '               HEALTH_URL / HEALTH_INTERVAL_MS / FAST_FAIL_MS / COOLDOWN_MS /',
     '               ATTEMPT_TIMEOUT_MS / RESPONSE_TIMEOUT_MS /',
-    '               PREF_TTL_MS / VERIFY_TLS=0 / RETRY_NON_IDEMPOTENT_AFTER_SEND=1 /',
-    '               RETRY_NON_IDEMPOTENT_WITH_IDEMPOTENCY_KEY=1',
+    '               PREF_TTL_MS / VERIFY_TLS=0 / DISCOVER_LOCAL_PROXY=0 /',
+    '               RETRY_NON_IDEMPOTENT_AFTER_SEND=1 / RETRY_NON_IDEMPOTENT_WITH_IDEMPOTENCY_KEY=1',
     ''
   ].join('\n'));
 }
@@ -101,6 +102,7 @@ export function parseArgs(args, env = {}) {
     cooldownMs: integer('COOLDOWN_MS', envValue(env, 'COOLDOWN_MS') ?? 30000, 0, 600000),
     retryNonIdempotentAfterSend: env.RETRY_NON_IDEMPOTENT_AFTER_SEND === '1',
     retryNonIdempotentWithIdempotencyKey: env.RETRY_NON_IDEMPOTENT_WITH_IDEMPOTENCY_KEY === '1',
+    discoverLocalProxy: env.DISCOVER_LOCAL_PROXY !== '0',
     verifyTls: env.VERIFY_TLS !== '0'
   };
 
@@ -131,6 +133,7 @@ export function parseArgs(args, env = {}) {
       case '--response-timeout-ms': opts.responseTimeoutMs = integer(arg, next(), 100, 600000); break;
       case '--pref-ttl-ms': opts.prefTtlMs = integer(arg, next(), 0, 3600000); break;
       case '--no-verify-tls': opts.verifyTls = false; break;
+      case '--no-discover-local-proxy': opts.discoverLocalProxy = false; break;
       case '--retry-non-idempotent-after-send': opts.retryNonIdempotentAfterSend = true; break;
       case '--retry-non-idempotent-with-idempotency-key': opts.retryNonIdempotentWithIdempotencyKey = true; break;
       case '-h':
@@ -197,6 +200,7 @@ async function main() {
           nonIdempotentAfterSend: opts.retryNonIdempotentAfterSend,
           idempotencyKey: opts.retryNonIdempotentWithIdempotencyKey
         },
+        discoverLocalProxy: opts.discoverLocalProxy,
         verifyTls: opts.verifyTls
       };
       process.stdout.write(JSON.stringify(view, null, 2) + '\n');

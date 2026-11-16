@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.9.0
+
+### Added
+
+- 本机代理兜底发现（Linux）：配置 `healthUrl` 时启动后异步扫描回环/通配 LISTEN 端口；具体目标全部候选失败后按目标扫描；健康全失败时再触发。
+- 行为探测：HTTPS 目标要求 `CONNECT` 2xx；HTTP 目标接受 `<500 且非 407` 的响应；不发送请求体、不携带凭证。
+- 发现项排在 `direct` 前，最多 8 条，TTL 5 分钟，成功使用或健康选中时刷新；默认跳过带 `x-agent-dual-proxy: 1` 的兄弟实例。
+- `discoverLocalProxy`：库层默认 `false`；`dual-proxy` / `agent-gateway` 默认开启，支持 `--no-discover-local-proxy` 与 `DISCOVER_LOCAL_PROXY=0`；`--print-config` 输出。
+- 按目标失败发现只对目标端口 80/443、非回环/私网目标触发；自定义端口/私网端点需要显式 `--gateway`。
+
+### Changed
+
+- 启动发现只注入候选，不抢占已有 `preferred`，不强制复检；已有 preferred 是否失效交给正常健康检查。
+- 发现与重试不绕过两档冷却、`preferDirect`/`preferProxy` 和偏好缓存；非幂等请求复用 `shouldRetryAfterSend`。
+
+### Tests
+
+- 新增 `test/discovery.test.js`：`/proc` 解析、HTTP/HTTPS 探测判定、身份端点、三种触发、非幂等边界、CONNECT 重试、TTL、CLI/env；`discovery.js` 行/分支/函数 100%。
+- 总用例 169；项目级行覆盖 95.39%。
+
 ## 0.8.0
 
 ### Added

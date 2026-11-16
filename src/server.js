@@ -13,6 +13,14 @@ import { createPref } from './pref.js';
 import { buildCandidates } from './gateways.js';
 import { createRouteDecision } from './rules.js';
 import { hasIdempotencyKey, isIdempotent, shouldRetryAfterSend } from './retry-policy.js';
+import {
+  discoverLocalProxies,
+  isPrivateTarget,
+  IDENTITY_PATH,
+  IDENTITY_HEADER
+} from './discovery.js';
+
+export { IDENTITY_PATH, IDENTITY_HEADER };
 
 const DEFAULT_LOG = (msg) => process.stderr.write('[dual-proxy] ' + msg + '\n');
 
@@ -20,10 +28,6 @@ const DEFAULT_LOG = (msg) => process.stderr.write('[dual-proxy] ' + msg + '\n');
 export function isKnownFirst(knownId, list) {
   return Boolean(knownId && list && list[0] && list[0].id === knownId);
 }
-
-/** 本地身份端点：端口复用前用来确认监听者确实是本代理。 */
-export const IDENTITY_PATH = '/__agent_dual_proxy__';
-export const IDENTITY_HEADER = 'x-agent-dual-proxy';
 
 /** 合并配置：显式传入的 undefined 不应覆盖默认值。 */
 export function mergeOptions(defaults, options) {
@@ -164,7 +168,7 @@ function parseHealthUrl(value) {
  * @param {number} [options.prefTtlMs=60000]
  * @param {boolean} [options.verifyTls=true]
  * @param {function} [options.log]
- * @param {object} [internals] 仅测试注入：`tlsProbePort`、`onAttempt`；不进入公开 options/CLI
+ * @param {object} [internals] 仅测试注入：`tlsProbePort`、`onAttempt`、`discoveryFind`、`startupDiscovery`；不进入公开 options/CLI
  */
 export function createDispatcher(options, internals = {}) {
   const opts = mergeOptions({
@@ -189,6 +193,12 @@ export function createDispatcher(options, internals = {}) {
     verifyTls: true,
     preferDirect: [],
     preferProxy: [],
+    discoverLocalProxy: false,
+    discoveryTtlMs: 300000,
+    discoveryMax: 8,
+    discoveryTimeoutMs: 800,
+    discoveryConcurrency: 8,
+    discoveryThrottleMs: 60000,
     log: DEFAULT_LOG
   }, options);
 
@@ -197,6 +207,7 @@ export function createDispatcher(options, internals = {}) {
   const testHooks = internals || {};
   const tlsProbePort = testHooks.tlsProbePort || 443;
   const onAttempt = typeof testHooks.onAttempt === 'function' ? testHooks.onAttempt : null;
+  const discoveryFind = typeof testHooks.discoveryFind === 'function' ? testHooks.discoveryFind : discoverLocalProxies;
   const pref = createPref(opts.prefTtlMs, undefined, opts.prefMaxSize);
   const upstreamCandidate = Object.assign(
     { host: opts.upstreamHost, port: opts.upstreamPort },
@@ -215,13 +226,113 @@ export function createDispatcher(options, internals = {}) {
   const candidates = buildFor({ host: opts.listenHost, port: opts.listenPort });
   const publicCandidates = publicView(candidates);
 
+  function syncPublicView() {
+    publicCandidates.length = 0;
+    publicCandidates.push(...publicView(candidates));
+  }
+
   /** 端口退避后按实际监听端口重建候选，避免把自己当网关形成自环。 */
   function rebindSelf(addr) {
     const rebuilt = buildFor({ host: addr.address, port: addr.port });
     candidates.length = 0;
     candidates.push(...rebuilt);
-    publicCandidates.length = 0;
-    publicCandidates.push(...publicView(candidates));
+    syncPublicView();
+  }
+
+  /** 发现项：id → {gateway, at}；TTL 到期移除，成功使用或健康选中时刷新 at。 */
+  const discovered = new Map();
+  let discoveryRunning = false;
+  let discoveryPromise = null;
+  let lastFailureDiscoveryAt = 0;
+
+  function pruneDiscovered() {
+    if (discovered.size === 0) return;
+    const now = Date.now();
+    let changed = false;
+    for (const [id, row] of discovered) {
+      if (now - row.at <= opts.discoveryTtlMs) continue;
+      discovered.delete(id);
+      const index = candidates.findIndex((gateway) => gateway.id === id);
+      if (index >= 0) candidates.splice(index, 1);
+      changed = true;
+    }
+    if (changed) syncPublicView();
+  }
+
+  function touchDiscovered(id) {
+    const row = discovered.get(id);
+    if (row) row.at = Date.now();
+  }
+
+  function addDiscovered(list) {
+    pruneDiscovered();
+    const now = Date.now();
+    let added = 0;
+    for (const item of list) {
+      const id = item.host + ':' + item.port;
+      const existing = candidates.find((gateway) => gateway.id === id);
+      if (existing) {
+        if (discovered.has(id)) discovered.get(id).at = now;
+        continue;
+      }
+      if (discovered.size >= opts.discoveryMax) break;
+      const gateway = { id, host: item.host, port: item.port, discovered: true };
+      const directIndex = candidates.findIndex((candidate) => candidate.direct);
+      candidates.splice(directIndex < 0 ? candidates.length : directIndex, 0, gateway);
+      discovered.set(id, { gateway, at: now });
+      added += 1;
+      log('discover: +' + id);
+    }
+    if (added > 0) syncPublicView();
+    return added;
+  }
+
+  function discoveryExcludePorts() {
+    const ports = new Set([Number(opts.listenPort)]);
+    for (const gateway of candidates) {
+      if (!gateway.direct) ports.add(Number(gateway.port));
+    }
+    return ports;
+  }
+
+  async function discoverFor(targetHost, targetPort, secure, reason) {
+    if (!opts.discoverLocalProxy) return 0;
+    if (discoveryRunning) return 0;
+    if (reason !== 'startup') {
+      const now = Date.now();
+      if (now - lastFailureDiscoveryAt < opts.discoveryThrottleMs) return 0;
+      lastFailureDiscoveryAt = now;
+    }
+    discoveryRunning = true;
+    discoveryPromise = (async () => {
+      try {
+        const result = await discoveryFind({
+          targetHost,
+          targetPort,
+          secure,
+          excludePorts: discoveryExcludePorts(),
+          limit: 64,
+          maxResults: opts.discoveryMax,
+          timeoutMs: opts.discoveryTimeoutMs,
+          concurrency: opts.discoveryConcurrency
+        });
+        log('discover: ' + reason + ' scanned ' + result.scanned + ' listening port(s), found ' + result.results.length);
+        return addDiscovered(result.results);
+      } catch (err) {
+        log('discover: ' + reason + ' failed: ' + (err && err.message ? err.message : String(err)));
+        return 0;
+      } finally {
+        discoveryRunning = false;
+        discoveryPromise = null;
+      }
+    })();
+    return discoveryPromise;
+  }
+
+  function canDiscoverForTarget(host, port) {
+    if (!opts.discoverLocalProxy) return false;
+    if (port !== 80 && port !== 443) return false;
+    return !isPrivateTarget(host);
   }
   const health = parseHealthUrl(opts.healthUrl);
   const healthTimeoutMs = opts.healthTimeoutMs || opts.attemptTimeoutMs;
@@ -290,6 +401,7 @@ export function createDispatcher(options, internals = {}) {
     pref.set(host, gateway.id);
     warmGateway(gateway.id);
     warmHost(host, gateway.id);
+    touchDiscovered(gateway.id);
   }
 
   function noteFailure(gateway, { host, phase } = {}) {
@@ -308,6 +420,7 @@ export function createDispatcher(options, internals = {}) {
 
   /** 候选顺序：健康首选 → 该 host 上次走通的网关 → 其余 → 目的地规则最后覆盖。 */
   function order(host) {
+    pruneDiscovered();
     const hot = [];
     const cold = [];
     for (const gateway of candidates) (isCooling(gateway.id, host) ? cold : hot).push(gateway);
@@ -338,7 +451,7 @@ export function createDispatcher(options, internals = {}) {
    * 依次试候选网关，返回第一个能承载 TLS（443 时）且连通的隧道。
    * 已有真正的已知路径（缓存或健康首选）时，第一条只给 fastFailTimeoutMs —— 它挂了要快点换。
    */
-  async function openTunnel(host, port) {
+  async function openTunnel(host, port, allowDiscovery = true) {
     const list = order(host);
     const known = knownPath(host, list);
     for (let i = 0; i < list.length; i += 1) {
@@ -366,6 +479,10 @@ export function createDispatcher(options, internals = {}) {
       }
       log(host + ':' + port + ' ' + gateway.id + ' failed (' + opened.phase + ')');
       noteFailure(gateway, { host, phase: opened.phase });
+    }
+    if (allowDiscovery && canDiscoverForTarget(host, port)) {
+      const added = await discoverFor(host, port, true, 'target');
+      if (added > 0) return openTunnel(host, port, false);
     }
     log(host + ':' + port + ' all gateways failed');
     return null;
@@ -487,55 +604,66 @@ export function createDispatcher(options, internals = {}) {
         upstreamReq.end(body);
       });
 
+      const runAttempts = async (list, known, allowDiscovery) => {
+        for (let i = 0; i < list.length; i += 1) {
+          const gateway = list[i];
+          const timeout = i === 0 && known && opts.fastFailTimeoutMs < opts.attemptTimeoutMs
+            ? opts.fastFailTimeoutMs
+            : opts.attemptTimeoutMs;
+          if (onAttempt) onAttempt({ kind: 'http', host, port, index: i, gateway: gateway.id, timeout, known: Boolean(known) });
+          const r = await attemptVia(gateway, timeout);
+          if (r.err) {
+            log(host + ' ' + gateway.id + ' failed: ' + (r.err.code || r.err.message) +
+              ' (' + r.phase + ')');
+            noteFailure(gateway, { host, phase: r.phase });
+            // 407 是代理在转发前拒绝，目标没收到请求：无论方法是否幂等都应换下一条。
+            if (r.err.code === 'EPROXYAUTH') continue;
+            if (!shouldRetryAfterSend({
+              method: req.method,
+              sent: r.sent,
+              retryNonIdempotentAfterSend: opts.retryNonIdempotentAfterSend,
+              retryNonIdempotentWithIdempotencyKey: opts.retryNonIdempotentWithIdempotencyKey,
+              idempotencyKey
+            })) {
+              log(host + ' ' + gateway.id + ' failed after send: ' +
+                (r.err.code || r.err.message) + '; not replayed (' + req.method + ')');
+              res.writeHead(502);
+              res.end('non-idempotent request may have been delivered; not replayed');
+              return;
+            }
+            if (idempotencyKey && !isIdempotent(req.method) &&
+              opts.retryNonIdempotentWithIdempotencyKey && !opts.retryNonIdempotentAfterSend) {
+              log(host + ' ' + gateway.id + ' failed after send: ' +
+                (r.err.code || r.err.message) + '; retrying (' + req.method + ', idempotency key)');
+            }
+            continue;
+          }
+          noteSuccess(host, gateway);
+          const up = r.up;
+          up.on('error', () => { try { res.destroy(); } catch (e) { /* ignore */ } });
+          res.on('close', () => {
+            if (!res.writableEnded) { try { up.destroy(); } catch (e) { /* ignore */ } }
+          });
+          res.writeHead(up.statusCode, stripHopByHop(up.headers));
+          up.pipe(res);
+          return;
+        }
+        if (allowDiscovery && canDiscoverForTarget(host, port)) {
+          const added = await discoverFor(host, port, false, 'target');
+          if (added > 0) {
+            const nextList = order(host);
+            return runAttempts(nextList, knownPath(host, nextList), false);
+          }
+        }
+        res.writeHead(502);
+        res.end('all gateways failed');
+      };
+
       const list = order(host);
       const known = knownPath(host, list);
       (async () => {
         try {
-          for (let i = 0; i < list.length; i += 1) {
-            const gateway = list[i];
-            const timeout = i === 0 && known && opts.fastFailTimeoutMs < opts.attemptTimeoutMs
-              ? opts.fastFailTimeoutMs
-              : opts.attemptTimeoutMs;
-            if (onAttempt) onAttempt({ kind: 'http', host, port, index: i, gateway: gateway.id, timeout, known: Boolean(known) });
-            const r = await attemptVia(gateway, timeout);
-            if (r.err) {
-              log(host + ' ' + gateway.id + ' failed: ' + (r.err.code || r.err.message) +
-                ' (' + r.phase + ')');
-              noteFailure(gateway, { host, phase: r.phase });
-              // 407 是代理在转发前拒绝，目标没收到请求：无论方法是否幂等都应换下一条。
-              if (r.err.code === 'EPROXYAUTH') continue;
-              if (!shouldRetryAfterSend({
-                method: req.method,
-                sent: r.sent,
-                retryNonIdempotentAfterSend: opts.retryNonIdempotentAfterSend,
-                retryNonIdempotentWithIdempotencyKey: opts.retryNonIdempotentWithIdempotencyKey,
-                idempotencyKey
-              })) {
-                log(host + ' ' + gateway.id + ' failed after send: ' +
-                  (r.err.code || r.err.message) + '; not replayed (' + req.method + ')');
-                res.writeHead(502);
-                res.end('non-idempotent request may have been delivered; not replayed');
-                return;
-              }
-              if (idempotencyKey && !isIdempotent(req.method) &&
-                opts.retryNonIdempotentWithIdempotencyKey && !opts.retryNonIdempotentAfterSend) {
-                log(host + ' ' + gateway.id + ' failed after send: ' +
-                  (r.err.code || r.err.message) + '; retrying (' + req.method + ', idempotency key)');
-              }
-              continue;
-            }
-            noteSuccess(host, gateway);
-            const up = r.up;
-            up.on('error', () => { try { res.destroy(); } catch (e) { /* ignore */ } });
-            res.on('close', () => {
-              if (!res.writableEnded) { try { up.destroy(); } catch (e) { /* ignore */ } }
-            });
-            res.writeHead(up.statusCode, stripHopByHop(up.headers));
-            up.pipe(res);
-            return;
-          }
-          res.writeHead(502);
-          res.end('all gateways failed');
+          await runAttempts(list, known, true);
         } catch (err) {
           log(host + ' handler error: ' + (err && err.message));
           if (!res.headersSent) {
@@ -611,6 +739,7 @@ export function createDispatcher(options, internals = {}) {
   async function runHealth() {
     if (healthRunning) return;
     healthRunning = true;
+    let recheck = false;
     try {
       let result = null;
       try {
@@ -626,13 +755,22 @@ export function createDispatcher(options, internals = {}) {
         pref.set(health.host, result.id);
         warmGateway(result.id);
         warmHost(health.host, result.id);
+        touchDiscovered(result.id);
       } else {
         if (preferred !== null) log('health: no gateway reached ' + health.host + ':' + health.port);
         preferred = null;
         pref.delete(health.host);
+        if (opts.discoverLocalProxy && health) {
+          const added = await discoverFor(health.host, health.port, health.secure, 'health');
+          if (added > 0) recheck = true;
+        }
       }
     } finally {
       healthRunning = false;
+      if (recheck) {
+        const timer = setTimeout(runHealth, 0);
+        if (timer.unref) timer.unref();
+      }
     }
   }
 
@@ -685,6 +823,13 @@ export function createDispatcher(options, internals = {}) {
             const addr = await listenOnce(port);
             // 退避后实际端口可能变了：重建候选，别把自己当网关
             if (addr.port !== opts.listenPort || addr.address !== opts.listenHost) rebindSelf(addr);
+            if (opts.discoverLocalProxy && health && testHooks.startupDiscovery !== false) {
+              // 启动兜底发现：异步，不阻塞 listen；只补候选，不抢占已有 preferred。
+              const timer = setTimeout(() => {
+                discoverFor(health.host, health.port, health.secure, 'startup');
+              }, 0);
+              if (timer.unref) timer.unref();
+            }
             return addr;
           } catch (err) {
             if (err.code !== 'EADDRINUSE') throw err;

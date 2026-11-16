@@ -20,7 +20,8 @@ const LAUNCHER_OPTS = [
   '--fast-fail-ms', '--cooldown-ms', '--pref-ttl-ms'
 ];
 const FLAGS = [
-  '--no-verify-tls', '--retry-non-idempotent-after-send',
+  '--no-verify-tls', '--no-discover-local-proxy',
+  '--retry-non-idempotent-after-send',
   '--retry-non-idempotent-with-idempotency-key'
 ];
 
@@ -54,6 +55,7 @@ function usage() {
     '  --cooldown-ms <ms>          failed gateway rest, default 30000',
     '  --pref-ttl-ms <ms>          per-host preference TTL, default 60000',
     '  --no-verify-tls             skip the TLS reachability probe on 443',
+    '  --no-discover-local-proxy   disable local proxy discovery fallback',
     '  --retry-non-idempotent-after-send  replay POST/PATCH after the body may have',
     '                              been sent (dangerous; default off)',
     '  --retry-non-idempotent-with-idempotency-key',
@@ -107,6 +109,7 @@ function parseArgs(argv, env = process.env) {
     cooldownMs: integer('COOLDOWN_MS', env.COOLDOWN_MS ?? 30000, 0, 600000),
     retryNonIdempotentAfterSend: env.RETRY_NON_IDEMPOTENT_AFTER_SEND === '1',
     retryNonIdempotentWithIdempotencyKey: env.RETRY_NON_IDEMPOTENT_WITH_IDEMPOTENCY_KEY === '1',
+    discoverLocalProxy: env.DISCOVER_LOCAL_PROXY !== '0',
     verifyTls: env.VERIFY_TLS !== '0'
   };
   const rest = [];
@@ -138,6 +141,7 @@ function parseArgs(argv, env = process.env) {
     }
     if (FLAGS.includes(arg)) {
       if (arg === '--no-verify-tls') opts.verifyTls = false;
+      else if (arg === '--no-discover-local-proxy') opts.discoverLocalProxy = false;
       else if (arg === '--retry-non-idempotent-after-send') opts.retryNonIdempotentAfterSend = true;
       else if (arg === '--retry-non-idempotent-with-idempotency-key') opts.retryNonIdempotentWithIdempotencyKey = true;
       continue;
@@ -355,6 +359,7 @@ function printConfig(argv) {
       nonIdempotentAfterSend: opts.retryNonIdempotentAfterSend,
       idempotencyKey: opts.retryNonIdempotentWithIdempotencyKey
     },
+    discoverLocalProxy: opts.discoverLocalProxy,
     verifyTls: opts.verifyTls
   };
   process.stdout.write(JSON.stringify(view, null, 2) + '\n');
